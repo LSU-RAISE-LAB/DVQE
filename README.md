@@ -34,6 +34,14 @@ This package supports different quantum initialization methods and advanced circ
 
 ---
 
+## 📚 Citation
+
+If you use this framework or its solvers in your research, please cite:
+
+> M. Hasanzadeh and A. Kargarian, "Distributed Implementation of Variational Quantum Eigensolver to Solve QUBO Problems," http://arxiv.org/abs/2506.20819
+
+
+
 ## 📦 Installation
 
 To install the package directly from GitHub:
