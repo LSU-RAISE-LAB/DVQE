@@ -38,7 +38,7 @@ This package supports different quantum initialization methods and advanced circ
 
 If you use this framework or its solvers in your research, please cite:
 
-> M. Hasanzadeh and A. Kargarian, "Distributed Implementation of Variational Quantum Eigensolver to Solve QUBO Problems," http://arxiv.org/abs/2506.20819
+> M. Hasanzadeh and A. Kargarian, "Distributed Implementation of Variational Quantum Eigensolver to Solve QUBO Problems," https://arxiv.org/abs/2508.17471
 
 
 
