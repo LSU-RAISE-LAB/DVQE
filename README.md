@@ -41,6 +41,19 @@ If you use this framework or its solvers in your research, please cite:
 > M. Hasanzadeh and A. Kargarian, "Distributed Implementation of Variational Quantum Eigensolver to Solve QUBO Problems," https://arxiv.org/abs/2508.17471
 
 
+---
+
+## 👤 Author
+
+**Milad Hasanzadeh**  
+Department of Electrical and Computer Engineering  
+Louisiana State University  
+📧 e.mhasanzadeh1377@yahoo.com  
+
+📅 **Release Date:** August 2025  
+📄 **License:** Academic and Research Use Only  
+
+---
 
 ## 📦 Installation
 
