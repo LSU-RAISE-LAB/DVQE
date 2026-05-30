@@ -1,7 +1,7 @@
 # ==============================================================================
-# Title       : Cached and Batched Scalable dvqe Framework
+# Title       : Cached Scalable dvqe Framework for Monolithic and Distributed Execution
 # Author      : Milad Hasanzadeh
-# Revision    : Cached parameterized circuits + batched SPSA + batched metaheuristics
+# Revision    : Cached parameterized circuits + sampling energy + SPSA optimizer
 #
 # Main changes in this version:
 # 1. Builds the parameterized ansatz circuit once.
@@ -10,12 +10,10 @@
 # 4. Adds measurements once.
 # 5. Tries to transpile the measured parameterized circuit once.
 # 6. During optimization, only binds new parameter values and runs the simulator.
-# 7. Runs SPSA plus/minus circuits in one backend call.
-# 8. Evaluates metaheuristic candidate populations in batched backend calls.
-# 9. Uses sampling-based QUBO energy, not density matrices.
-# 10. Uses SPSA, not finite-difference Adam.
-# 11. Keeps the main solver name lowercase: dvqe(...)
-# ============================================================================== 
+# 7. Uses sampling-based QUBO energy, not density matrices.
+# 8. Uses SPSA, not finite-difference Adam.
+# 9. Keeps the main solver name lowercase: dvqe(...)
+# ==============================================================================
 
 import random
 import warnings
@@ -89,7 +87,12 @@ def create_monolithic_parameterized_ansatz(
     num_qubits: int,
     depth: int,
 ) -> Tuple[QuantumCircuit, List[Parameter]]:
-    """Create a symbolic monolithic RX-RY ansatz."""
+    """
+    Create a symbolic monolithic RX-RY ansatz.
+
+    The circuit is built once. Numerical values are inserted later using
+    assign_parameters or bind_parameters.
+    """
     qc = QuantumCircuit(num_qubits)
     parameters = []
     p = 0
@@ -98,6 +101,7 @@ def create_monolithic_parameterized_ansatz(
         for q in range(num_qubits):
             theta_ry = Parameter(f"theta_{p}")
             p += 1
+
             theta_rx = Parameter(f"theta_{p}")
             p += 1
 
@@ -138,6 +142,7 @@ def create_distributed_parameterized_ansatz(
         for q in all_qubits:
             theta_ry = Parameter(f"theta_{p}")
             p += 1
+
             theta_rx = Parameter(f"theta_{p}")
             p += 1
 
@@ -279,6 +284,7 @@ def estimate_energy_from_histogram(
         raise RuntimeError("Empty histogram. Cannot estimate energy.")
 
     energy = 0.0
+
     for bstring, count in histogram.items():
         z = np.array([int(b) for b in bstring], dtype=int)
         energy += (count / total) * qubo_cost(z, Q, q_linear)
@@ -287,12 +293,49 @@ def estimate_energy_from_histogram(
 
 
 # ====================================================
-# CACHED + BATCHED CIRCUIT EVALUATOR
+# TOPOLOGY HELPER
+# ====================================================
+
+def prepare_topology(mode: str, n: int, qpu_qubit_config: Optional[List[int]]):
+    """Prepare DISKIT topology for distributed mode."""
+    if mode == "monolithic":
+        return None, 1, [n]
+
+    if qpu_qubit_config is None:
+        raise ValueError("qpu_qubit_config is required for distributed mode.")
+
+    if sum(qpu_qubit_config) < n:
+        raise ValueError(
+            f"QPU config provides insufficient qubits: need {n}, got {sum(qpu_qubit_config)}"
+        )
+
+    cumulative = 0
+    adjusted = []
+
+    for q in qpu_qubit_config:
+        if cumulative + q <= n:
+            adjusted.append(q)
+            cumulative += q
+        else:
+            adjusted.append(n - cumulative)
+            break
+
+    adjusted = [q for q in adjusted if q > 0]
+    num_qpus = len(adjusted)
+
+    topo = Topology()
+    topo.create_qmap(num_qpus, adjusted)
+
+    return topo, num_qpus, adjusted
+
+
+# ====================================================
+# CACHED CIRCUIT EVALUATOR
 # ====================================================
 
 class CachedCircuitEvaluator:
     """
-    Builds quantum circuit infrastructure once and reuses it.
+    Builds the quantum circuit infrastructure once and reuses it.
 
     Cached once:
     - topology
@@ -307,10 +350,6 @@ class CachedCircuitEvaluator:
     - bind parameter values
     - run simulator
     - compute sampled QUBO energy
-
-    Batched features:
-    - energies([...]) runs many parameter vectors in one backend call.
-    - spsa_pair_energy(theta_plus, theta_minus) runs SPSA pair in one backend call.
     """
 
     def __init__(
@@ -323,7 +362,6 @@ class CachedCircuitEvaluator:
         backend=None,
         transpile_once: bool = True,
         transpile_optimization_level: int = 0,
-        batch_size: Optional[int] = None,
     ):
         self.mode = mode
         self.Q = np.asarray(Q, dtype=float)
@@ -333,7 +371,6 @@ class CachedCircuitEvaluator:
         self.backend = backend if backend is not None else sim
         self.transpile_once = transpile_once
         self.transpile_optimization_level = transpile_optimization_level
-        self.batch_size = batch_size
 
         if self.Q.shape != (self.n, self.n):
             raise ValueError(f"Q must have shape {(self.n, self.n)}, got {self.Q.shape}.")
@@ -345,7 +382,13 @@ class CachedCircuitEvaluator:
         )
 
         self.base_circuit, self.parameters = self._build_base_parameterized_circuit()
-        self.measured_circuit = add_qubo_measurements_once(self.base_circuit, self.mode, self.n)
+
+        self.measured_circuit = add_qubo_measurements_once(
+            self.base_circuit,
+            self.mode,
+            self.n,
+        )
+
         self.run_circuit_template = self._try_transpile_once(self.measured_circuit)
 
     @property
@@ -358,6 +401,7 @@ class CachedCircuitEvaluator:
 
         if self.mode == "distributed":
             qregs = self.topo.get_regs()
+
             ansatz_qc, parameters = create_distributed_parameterized_ansatz(
                 qregs=qregs,
                 depth=self.depth,
@@ -383,65 +427,21 @@ class CachedCircuitEvaluator:
             return circuit
 
     def bind(self, param_values: Union[List[float], np.ndarray]) -> QuantumCircuit:
-        return bind_parameter_values(self.run_circuit_template, self.parameters, param_values)
-
-    def bind_many(self, param_matrix: Union[List[np.ndarray], np.ndarray]) -> List[QuantumCircuit]:
-        """Bind many parameter vectors to the cached circuit template."""
-        param_matrix = np.asarray(param_matrix, dtype=float)
-
-        if param_matrix.ndim == 1:
-            param_matrix = param_matrix.reshape(1, -1)
-
-        if param_matrix.shape[1] != self.num_params:
-            raise ValueError(f"Expected parameter dimension {self.num_params}, got {param_matrix.shape[1]}.")
-
-        return [self.bind(row) for row in param_matrix]
-
-    def _run_circuit_batch(
-        self,
-        circuits: List[QuantumCircuit],
-        num_shots: int,
-    ):
-        """Run a list of circuits in one or multiple backend calls."""
-        if len(circuits) == 0:
-            return []
-
-        if self.batch_size is None or self.batch_size <= 0:
-            batch_size = len(circuits)
-        else:
-            batch_size = int(self.batch_size)
-
-        all_counts = []
-
-        for start in range(0, len(circuits), batch_size):
-            batch = circuits[start:start + batch_size]
-            result = self.backend.run(batch, shots=num_shots).result()
-
-            if len(batch) == 1:
-                all_counts.append(result.get_counts(0))
-            else:
-                for k in range(len(batch)):
-                    all_counts.append(result.get_counts(k))
-
-        return all_counts
+        return bind_parameter_values(
+            self.run_circuit_template,
+            self.parameters,
+            param_values,
+        )
 
     def counts(
         self,
         param_values: Union[List[float], np.ndarray],
         num_shots: int = 1024,
     ) -> Dict[str, int]:
-        """Run one parameter vector and return normalized QUBO-bit histogram."""
-        return self.histograms([param_values], num_shots=num_shots)[0]
-
-    def histograms(
-        self,
-        param_matrix: Union[List[np.ndarray], np.ndarray],
-        num_shots: int = 1024,
-    ) -> List[Dict[str, int]]:
-        """Run many parameter vectors in batched backend calls."""
-        circuits = self.bind_many(param_matrix)
-        raw_counts_list = self._run_circuit_batch(circuits, num_shots=num_shots)
-        return [normalize_counts_to_qubo_bits(counts_raw, self.n) for counts_raw in raw_counts_list]
+        bound_circuit = self.bind(param_values)
+        result = self.backend.run(bound_circuit, shots=num_shots).result()
+        counts_raw = result.get_counts()
+        return normalize_counts_to_qubo_bits(counts_raw, self.n)
 
     def energy(
         self,
@@ -450,34 +450,6 @@ class CachedCircuitEvaluator:
     ) -> float:
         histogram = self.counts(param_values, num_shots=num_shots)
         return estimate_energy_from_histogram(histogram, self.Q, self.q_linear)
-
-    def energies(
-        self,
-        param_matrix: Union[List[np.ndarray], np.ndarray],
-        num_shots: int = 1024,
-    ) -> np.ndarray:
-        """
-        Evaluate many candidate parameter vectors using batched backend calls.
-
-        This is used to speed up metaheuristic candidate population evaluations.
-        """
-        histograms = self.histograms(param_matrix, num_shots=num_shots)
-        energies = [estimate_energy_from_histogram(hist, self.Q, self.q_linear) for hist in histograms]
-        return np.asarray(energies, dtype=float)
-
-    def spsa_pair_energy(
-        self,
-        theta_plus: np.ndarray,
-        theta_minus: np.ndarray,
-        num_shots: int = 1024,
-    ) -> Tuple[float, float]:
-        """
-        Evaluate theta_plus and theta_minus in one backend call.
-
-        This reduces simulator/backend overhead compared to two separate calls.
-        """
-        energies = self.energies(np.vstack([theta_plus, theta_minus]), num_shots=num_shots)
-        return float(energies[0]), float(energies[1])
 
     def energy_and_histogram(
         self,
@@ -488,13 +460,23 @@ class CachedCircuitEvaluator:
         energy = estimate_energy_from_histogram(histogram, self.Q, self.q_linear)
         return energy, histogram
 
-    def circuit_with_bound_parameters(self, param_values: Union[List[float], np.ndarray]) -> QuantumCircuit:
-        """Return final bound measured circuit."""
+    def circuit_with_bound_parameters(
+        self,
+        param_values: Union[List[float], np.ndarray],
+    ) -> QuantumCircuit:
+        """Return final bound circuit using the cached measured circuit template."""
         return self.bind(param_values)
 
-    def circuit_without_measurements(self, param_values: Union[List[float], np.ndarray]) -> QuantumCircuit:
+    def circuit_without_measurements(
+        self,
+        param_values: Union[List[float], np.ndarray],
+    ) -> QuantumCircuit:
         """Return final bound circuit without the measurement-added wrapper."""
-        return bind_parameter_values(self.base_circuit, self.parameters, param_values)
+        return bind_parameter_values(
+            self.base_circuit,
+            self.parameters,
+            param_values,
+        )
 
 
 # ====================================================
@@ -517,9 +499,13 @@ def compute_sampling_energy(
     """
     Backward-compatible one-shot sampling energy.
 
-    dvqe(...) does not use this inside its main loop.
+    This rebuilds a temporary evaluator, so dvqe(...) does not use this function
+    inside its optimization loop. It is kept for external compatibility.
     """
-    qpu_config = [n]
+    if mode == "monolithic":
+        qpu_config = [n]
+    else:
+        qpu_config = [n]
 
     evaluator = CachedCircuitEvaluator(
         mode=mode,
@@ -531,7 +517,11 @@ def compute_sampling_energy(
         transpile_once=True,
     )
 
-    energy, histogram = evaluator.energy_and_histogram(param_values, num_shots=num_shots)
+    energy, histogram = evaluator.energy_and_histogram(
+        param_values,
+        num_shots=num_shots,
+    )
+
     circuit = evaluator.circuit_without_measurements(param_values)
 
     if return_circuit:
@@ -549,8 +539,7 @@ class SPSAOptimizer:
     SPSA optimizer.
 
     It uses two energy evaluations per iteration, independent of the number of
-    variational parameters. In dvqe(...), the two evaluations are batched into
-    one backend call through evaluator.spsa_pair_energy(...).
+    variational parameters.
     """
 
     def __init__(
@@ -574,42 +563,28 @@ class SPSAOptimizer:
         ck = self.c / ((k + 1) ** self.gamma)
         return ak, ck
 
-    def perturb(self, theta: np.ndarray, k: int):
-        """Create SPSA theta_plus/theta_minus pair."""
+    def step(self, theta: np.ndarray, k: int, energy_function):
         theta = np.asarray(theta, dtype=float)
         ak, ck = self.gains(k)
+
         delta = self.rng.choice([-1.0, 1.0], size=theta.shape)
 
         theta_plus = np.mod(theta + ck * delta, 2 * np.pi)
         theta_minus = np.mod(theta - ck * delta, 2 * np.pi)
 
-        return ak, ck, delta, theta_plus, theta_minus
+        e_plus = energy_function(theta_plus)
+        e_minus = energy_function(theta_minus)
 
-    def update_from_pair(
-        self,
-        theta: np.ndarray,
-        ak: float,
-        ck: float,
-        delta: np.ndarray,
-        e_plus: float,
-        e_minus: float,
-    ):
-        """Compute SPSA update after batched energy evaluation."""
         gradient_estimate = ((e_plus - e_minus) / (2.0 * ck)) * delta
         update = -ak * gradient_estimate
-        theta_new = np.mod(theta + update, 2 * np.pi)
-        return theta_new, update
 
-    def step(self, theta: np.ndarray, k: int, evaluator: CachedCircuitEvaluator, num_shots: int):
-        """One SPSA step with theta_plus/theta_minus executed in one backend call."""
-        ak, ck, delta, theta_plus, theta_minus = self.perturb(theta, k)
-        e_plus, e_minus = evaluator.spsa_pair_energy(theta_plus, theta_minus, num_shots=num_shots)
-        theta_new, update = self.update_from_pair(theta, ak, ck, delta, e_plus, e_minus)
+        theta_new = np.mod(theta + update, 2 * np.pi)
+
         return theta_new, update, float(e_plus), float(e_minus), theta_plus, theta_minus
 
 
 # ====================================================
-# REDUCED-COST BATCHED METAHEURISTIC INITIALIZERS
+# REDUCED-COST METAHEURISTIC INITIALIZERS
 # ====================================================
 
 def black_hole_optimize_vqe(
@@ -619,38 +594,36 @@ def black_hole_optimize_vqe(
     max_iter: int = 8,
     num_shots: int = 256,
 ) -> np.ndarray:
-    """Reduced-cost Black Hole initialization using batched population evaluation."""
+    """Reduced-cost Black Hole initialization using cached circuit evaluator."""
     N = max(1, int(N))
     max_iter = max(0, int(max_iter))
 
     stars = np.random.uniform(0, 2 * np.pi, size=(N, num_params))
-    energies = evaluator.energies(stars, num_shots=num_shots)
+    energies = np.array([
+        evaluator.energy(s, num_shots=num_shots)
+        for s in stars
+    ])
 
     for _ in range(max_iter):
         bh_index = int(np.argmin(energies))
         bh = stars[bh_index].copy()
         bh_energy = energies[bh_index]
-        r_event = abs(bh_energy) / (np.sum(np.abs(energies)) + 1e-8)
 
-        candidate_indices = []
-        candidate_params = []
+        r_event = abs(bh_energy) / (np.sum(np.abs(energies)) + 1e-8)
 
         for i in range(N):
             if i == bh_index:
                 continue
 
-            stars[i] = np.mod(stars[i] + random.random() * (bh - stars[i]), 2 * np.pi)
+            stars[i] = np.mod(
+                stars[i] + random.random() * (bh - stars[i]),
+                2 * np.pi,
+            )
 
             if np.linalg.norm(stars[i] - bh) < r_event:
                 stars[i] = np.random.uniform(0, 2 * np.pi, size=num_params)
 
-            candidate_indices.append(i)
-            candidate_params.append(stars[i].copy())
-
-        if candidate_params:
-            new_energies = evaluator.energies(np.asarray(candidate_params), num_shots=num_shots)
-            for idx, e in zip(candidate_indices, new_energies):
-                energies[idx] = e
+            energies[i] = evaluator.energy(stars[i], num_shots=num_shots)
 
     return stars[int(np.argmin(energies))]
 
@@ -662,22 +635,24 @@ def gwo_optimize_vqe(
     max_iter: int = 8,
     num_shots: int = 256,
 ) -> np.ndarray:
-    """Reduced-cost Grey Wolf Optimizer initialization using batched population evaluation."""
+    """Reduced-cost Grey Wolf Optimizer initialization using cached circuit evaluator."""
     N = max(5, int(N))
     max_iter = max(0, int(max_iter))
 
     wolves = np.random.uniform(0, 2 * np.pi, size=(N, num_params))
-    energies = evaluator.energies(wolves, num_shots=num_shots)
+    energies = np.array([
+        evaluator.energy(w, num_shots=num_shots)
+        for w in wolves
+    ])
 
     for t in range(max_iter):
         sorted_idx = np.argsort(energies)
+
         alpha = wolves[sorted_idx[0]].copy()
         beta = wolves[sorted_idx[1]].copy()
         delta = wolves[sorted_idx[2]].copy()
 
         a = 2.0 - 2.0 * (t / max_iter) if max_iter > 0 else 0.0
-
-        new_wolves = np.zeros_like(wolves)
 
         for i in range(N):
             r1 = np.random.rand(num_params)
@@ -698,10 +673,8 @@ def gwo_optimize_vqe(
             C3 = 2 * r2
             X3 = delta - A3 * np.abs(C3 * delta - wolves[i])
 
-            new_wolves[i] = np.mod((X1 + X2 + X3) / 3.0, 2 * np.pi)
-
-        wolves = new_wolves
-        energies = evaluator.energies(wolves, num_shots=num_shots)
+            wolves[i] = np.mod((X1 + X2 + X3) / 3.0, 2 * np.pi)
+            energies[i] = evaluator.energy(wolves[i], num_shots=num_shots)
 
     return wolves[int(np.argmin(energies))]
 
@@ -714,31 +687,29 @@ def abc_optimize_vqe(
     limit: int = 3,
     num_shots: int = 256,
 ) -> np.ndarray:
-    """Reduced-cost Artificial Bee Colony initialization using batched candidate evaluation."""
+    """Reduced-cost Artificial Bee Colony initialization using cached circuit evaluator."""
     N = max(5, int(N))
     max_iter = max(0, int(max_iter))
     limit = max(1, int(limit))
 
     food = np.random.uniform(0, 2 * np.pi, size=(N, num_params))
-    fitness = evaluator.energies(food, num_shots=num_shots)
+    fitness = np.array([
+        evaluator.energy(f, num_shots=num_shots)
+        for f in food
+    ])
     trial = np.zeros(N)
 
     for _ in range(max_iter):
-        # Employed bees: build all candidates first, then evaluate as one batch.
-        employed_candidates = []
         for i in range(N):
             k = np.random.choice([j for j in range(N) if j != i])
             phi = np.random.uniform(-1, 1, size=num_params)
             v = np.mod(food[i] + phi * (food[i] - food[k]), 2 * np.pi)
-            employed_candidates.append(v)
 
-        employed_candidates = np.asarray(employed_candidates)
-        employed_energies = evaluator.energies(employed_candidates, num_shots=num_shots)
+            energy = evaluator.energy(v, num_shots=num_shots)
 
-        for i in range(N):
-            if employed_energies[i] < fitness[i]:
-                food[i] = employed_candidates[i]
-                fitness[i] = employed_energies[i]
+            if energy < fitness[i]:
+                food[i] = v
+                fitness[i] = energy
                 trial[i] = 0
             else:
                 trial[i] += 1
@@ -746,38 +717,25 @@ def abc_optimize_vqe(
         weights = fitness.max() - fitness + 1e-8
         probs = weights / weights.sum() if weights.sum() > 0 else np.ones(N) / N
 
-        # Onlooker bees: build all candidates first, then evaluate as one batch.
-        onlooker_indices = []
-        onlooker_candidates = []
-
         for _bee in range(N):
             i = np.random.choice(N, p=probs)
             k = np.random.choice([j for j in range(N) if j != i])
             phi = np.random.uniform(-1, 1, size=num_params)
             v = np.mod(food[i] + phi * (food[i] - food[k]), 2 * np.pi)
-            onlooker_indices.append(i)
-            onlooker_candidates.append(v)
 
-        onlooker_candidates = np.asarray(onlooker_candidates)
-        onlooker_energies = evaluator.energies(onlooker_candidates, num_shots=num_shots)
+            energy = evaluator.energy(v, num_shots=num_shots)
 
-        for idx, v, energy in zip(onlooker_indices, onlooker_candidates, onlooker_energies):
-            if energy < fitness[idx]:
-                food[idx] = v
-                fitness[idx] = energy
-                trial[idx] = 0
+            if energy < fitness[i]:
+                food[i] = v
+                fitness[i] = energy
+                trial[i] = 0
             else:
-                trial[idx] += 1
+                trial[i] += 1
 
-        # Scout bees: evaluate replacement scouts in one batch.
-        scout_indices = [i for i in range(N) if trial[i] >= limit]
-        if scout_indices:
-            scouts = np.random.uniform(0, 2 * np.pi, size=(len(scout_indices), num_params))
-            scout_energies = evaluator.energies(scouts, num_shots=num_shots)
-
-            for local_idx, i in enumerate(scout_indices):
-                food[i] = scouts[local_idx]
-                fitness[i] = scout_energies[local_idx]
+        for i in range(N):
+            if trial[i] >= limit:
+                food[i] = np.random.uniform(0, 2 * np.pi, size=num_params)
+                fitness[i] = evaluator.energy(food[i], num_shots=num_shots)
                 trial[i] = 0
 
     return food[int(np.argmin(fitness))]
@@ -795,6 +753,7 @@ def best_solution_from_histogram(
 ) -> Tuple[np.ndarray, float]:
     """Return best QUBO solution among the top-k most frequent samples."""
     sorted_counts = sorted(histogram.items(), key=lambda item: -item[1])[:top_k]
+
     best_cost = float("inf")
     z_best = None
 
@@ -834,9 +793,15 @@ def sample_final_solution(
     measured = add_qubo_measurements_once(final_circuit, mode, n)
     result = sim.run(measured, shots=num_shots).result()
     counts_raw = result.get_counts()
+
     histogram = normalize_counts_to_qubo_bits(counts_raw, n)
 
-    z_best, best_cost = best_solution_from_histogram(histogram, Q, q_linear, top_k=top_k)
+    z_best, best_cost = best_solution_from_histogram(
+        histogram,
+        Q,
+        q_linear,
+        top_k=top_k,
+    )
 
     if return_histogram:
         return z_best, best_cost, histogram
@@ -845,41 +810,8 @@ def sample_final_solution(
 
 
 # ====================================================
-# TOPOLOGY AND INITIALIZATION HELPERS
+# PARAMETER INITIALIZATION
 # ====================================================
-
-def prepare_topology(mode: str, n: int, qpu_qubit_config: Optional[List[int]]):
-    """Prepare DISKIT topology for distributed mode."""
-    if mode == "monolithic":
-        return None, 1, [n]
-
-    if qpu_qubit_config is None:
-        raise ValueError("qpu_qubit_config is required for distributed mode.")
-
-    if sum(qpu_qubit_config) < n:
-        raise ValueError(
-            f"QPU config provides insufficient qubits: need {n}, got {sum(qpu_qubit_config)}"
-        )
-
-    cumulative = 0
-    adjusted = []
-
-    for q in qpu_qubit_config:
-        if cumulative + q <= n:
-            adjusted.append(q)
-            cumulative += q
-        else:
-            adjusted.append(n - cumulative)
-            break
-
-    adjusted = [q for q in adjusted if q > 0]
-    num_qpus = len(adjusted)
-
-    topo = Topology()
-    topo.create_qmap(num_qpus, adjusted)
-
-    return topo, num_qpus, adjusted
-
 
 def initialize_parameters(
     init_type: int,
@@ -888,7 +820,7 @@ def initialize_parameters(
     warm_start_iters: int,
     warm_start_shots: int,
 ) -> np.ndarray:
-    """Initialize ansatz parameters using cached and batched evaluator."""
+    """Initialize ansatz parameters using cached evaluator."""
     num_params = evaluator.num_params
 
     if init_type == 1:
@@ -949,10 +881,9 @@ def dvqe(
     verbose: bool = True,
     transpile_once: bool = True,
     transpile_optimization_level: int = 0,
-    batch_size: Optional[int] = None,
 ):
     """
-    Cached and batched scalable DVQE solver with lowercase name: dvqe(...)
+    Cached scalable DVQE solver with lowercase name: dvqe(...)
 
     Parameters:
     - mode: "monolithic" or "distributed"
@@ -964,7 +895,6 @@ def dvqe(
     - max_iters: number of SPSA iterations
     - qpu_qubit_config: QPU qubit allocation for distributed mode
     - rel_tol: stopping tolerance based on max parameter update
-    - batch_size: optional maximum number of circuits per backend run
 
     Returns:
     - z_best
@@ -987,7 +917,6 @@ def dvqe(
 
     top_k = 100 if n <= 7 else int(np.floor(n / 1.5) * 100)
 
-    # Build everything structural once.
     evaluator = CachedCircuitEvaluator(
         mode=mode,
         Q=Q,
@@ -997,10 +926,8 @@ def dvqe(
         backend=sim,
         transpile_once=transpile_once,
         transpile_optimization_level=transpile_optimization_level,
-        batch_size=batch_size,
     )
 
-    # Initialize once, using cached + batched evaluator for metaheuristics.
     param_values = initialize_parameters(
         init_type=init_type,
         evaluator=evaluator,
@@ -1019,18 +946,19 @@ def dvqe(
     best_energy = float("inf")
     best_params = param_values.copy()
 
+    def energy_function(theta):
+        return evaluator.energy(theta, num_shots=num_shots)
+
     for it in range(max_iters):
         old_params = param_values.copy()
 
-        # SPSA plus/minus circuits are executed in one backend call.
         param_values, update, e_plus, e_minus, theta_plus, theta_minus = optimizer.step(
             theta=param_values,
             k=it,
-            evaluator=evaluator,
-            num_shots=num_shots,
+            energy_function=energy_function,
         )
 
-        # No third energy call. Use already-evaluated SPSA points.
+        # No third energy call. Use the already evaluated SPSA points.
         if e_plus <= e_minus:
             current_energy = e_plus
             current_best_candidate = theta_plus
@@ -1055,9 +983,18 @@ def dvqe(
                 print(f"Converged at iteration {it + 1}.")
             break
 
-    # Final sampling uses same cached circuit. No remap/rebuild.
-    final_energy, hist = evaluator.energy_and_histogram(best_params, num_shots=final_shots)
-    z_best, cost_best = best_solution_from_histogram(hist, Q, q_linear, top_k=top_k)
+    final_energy, hist = evaluator.energy_and_histogram(
+        best_params,
+        num_shots=final_shots,
+    )
+
+    z_best, cost_best = best_solution_from_histogram(
+        hist,
+        Q,
+        q_linear,
+        top_k=top_k,
+    )
+
     final_circuit = evaluator.circuit_without_measurements(best_params)
 
     if verbose:
@@ -1068,5 +1005,5 @@ def dvqe(
     return z_best, final_circuit, hist
 
 
-# Backward-compatible alias. Recommended solver name is dvqe(...).
+# Optional backward-compatible alias. The recommended solver name is dvqe(...).
 DVQE = dvqe
