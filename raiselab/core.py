@@ -1,872 +1,807 @@
 # ==============================================================================
-# Title       : General VQE Framework for Monolithic and Distributed Execution
+# Title       : Cached and Batched Scalable dvqe Framework
 # Author      : Milad Hasanzadeh
-# Email       : e.mhasanzadeh1377@yahoo.com
-# Affiliation : Department of Electrical and Computer Engineering,
-#               Louisiana State University, Baton Rouge, LA, USA
-# Date        : July 26, 2025
+# Revision    : Cached parameterized circuits + batched SPSA + batched metaheuristics
 #
-# Description :
-# This Python module implements a modular hybrid Variational 
-# Quantum Eigensolver (VQE) framework capable of solving binary optimization 
-# problems in both monolithic and distributed quantum architectures.
-#
-# Inputs :
-# - Q : numpy.ndarray
-#       Symmetric QUBO matrix of shape (n, n), where n is the number of binary variables.
-# - c : numpy.ndarray or list
-#       Linear QUBO coefficients (bias vector) of shape (n,).
-# - init_type : int
-#       Initialization strategy: 1=random, 2=Black Hole, 3=GWO, 4=ABC
-# - depth : int
-#       Number of layers in the parameterized ansatz circuit.
-# - lr : float
-#       Learning rate used in the Adam optimizer.
-# - max_iters : int
-#       Maximum number of quantum optimization iterations.
-# - qpu_qubit_config : list of int
-#       Number of qubits per QPU (used only in distributed mode).
-# - rel_tol : float
-#       Relative tolerance for convergence based on max parameter update.
-# - mode : str
-#       Mode of execution: "monolithic" or "distributed".
-#
-# Outputs :
-# - z_best : numpy.ndarray
-#       Final optimized binary solution (bitstring) with lowest QUBO cost observed.
-# - final_circuit : qiskit.QuantumCircuit
-#       The final ansatz quantum circuit used to evaluate the solution.
-#
-# Functional Overview :
-# - Constructs parameterized ansatz circuits for both centralized and distributed layouts.
-# - Supports custom topologies via QPU configuration (multi-region QPU partitioning).
-# - Defines QUBO → Hamiltonian conversion for Pauli-Z operators.
-# - Implements several metaheuristic-based initializers: Black Hole, GWO, ABC.
-# - Supports gradient-based parameter updates using Adam optimizer.
-# - Integrates circuit evaluation, energy expectation, and decoding routines.
-# - Tracks feasible bitstring candidates and selects the lowest-cost solution.
-# - Visualizes the final ansatz circuit for analysis and debugging.
-#
-# Key Features :
-# - Dual-mode architecture: 'monolithic' and 'distributed' execution via a single interface.
-# - Modular components for ansatz construction, energy computation, and optimization.
-# - Interoperable with any QUBO-formulated problem (linear or quadratic).
-# - Clear grouping of utility functions for extensibility and readability.
-# - Compatible with classical-to-quantum hybrid optimization pipelines (e.g., ADMM+VQE).
-#
-# Requirements :
-# - Python 3.8+
-# - Qiskit 0.39.0
-# - qiskit-aer 0.11.0
-# - qiskit-terra 0.22.0
-# - qiskit-optimization 0.4.0
-# - diskit 0.1 (for circuit distribution and remapping)
-#
-# License :
-# This module is intended for academic and research purposes only.
-# Redistribution or commercial use is not permitted without prior written consent.
-# Proper citation and acknowledgment must be provided when used in published work.
-#
-# Copyright (c) 2025, Milad Hasanzadeh
-# ==============================================================================
+# Main changes in this version:
+# 1. Builds the parameterized ansatz circuit once.
+# 2. Builds the DISKIT topology once.
+# 3. Remaps the distributed circuit once.
+# 4. Adds measurements once.
+# 5. Tries to transpile the measured parameterized circuit once.
+# 6. During optimization, only binds new parameter values and runs the simulator.
+# 7. Runs SPSA plus/minus circuits in one backend call.
+# 8. Evaluates metaheuristic candidate populations in batched backend calls.
+# 9. Uses sampling-based QUBO energy, not density matrices.
+# 10. Uses SPSA, not finite-difference Adam.
+# 11. Keeps the main solver name lowercase: dvqe(...)
+# ============================================================================== 
 
-
-# === Standard Library Imports ===
-import math
 import random
 import warnings
 from collections import defaultdict
-from typing import List, Tuple, Union, Optional, Dict
+from typing import Dict, List, Optional, Tuple, Union
 
-# === Scientific & Plotting Libraries ===
 import numpy as np
-import scipy.linalg as la
-import matplotlib.pyplot as plt
-from joblib import Parallel, delayed
 
-# === Qiskit Core Imports ===
-from qiskit import (
-    Aer, assemble, transpile,
-    QuantumCircuit, execute
-)
-from qiskit.circuit import Parameter
-from qiskit.visualization import plot_bloch_vector, plot_histogram
-from qiskit.quantum_info import (
-    Statevector, DensityMatrix, partial_trace, state_fidelity
-)
+from qiskit import Aer, QuantumCircuit, ClassicalRegister, transpile
+from qiskit.circuit import Parameter, QuantumRegister
 
-# === DISKIT Imports (Distributed Quantum Toolkit) ===
 from diskit import Topology, CircuitRemapper
 
-# === Jupyter Display Utilities ===
-from IPython.display import display
-
-# === Warning Filter ===
 warnings.filterwarnings("ignore")
 
-# === Define a global simulator instance ===
 sim = Aer.get_backend("qasm_simulator")
 
+
 # ====================================================
-# ⚙️ QUBO → PAULI HAMILTONIAN MAPPING
+# QUBO UTILITIES
 # ====================================================
+
+def qubo_cost(z: Union[np.ndarray, List[int]], Q: np.ndarray, q_linear: np.ndarray) -> float:
+    """Compute QUBO objective z^T Q z + q^T z."""
+    z = np.asarray(z, dtype=int)
+    return float(z.T @ Q @ z + q_linear @ z)
 
 
 def qubo_to_pauli_hamiltonian(Q: np.ndarray, q_linear: np.ndarray) -> List[Tuple[float, str]]:
     """
-    Converts a full QUBO Hamiltonian (Q, q) into Pauli-Z operator form.
+    QUBO-to-Pauli conversion kept for compatibility and inspection.
 
-    H(z) = z.T @ Q @ z + q.T @ z
-         = Σ Q_ij z_i z_j + Σ q_i z_i
-         = transformed into Σ coeff * PauliString (Z_i, Z_i Z_j, etc.)
-
-    Parameters:
-    ----------
-    Q : np.ndarray of shape (n, n)
-        Symmetric QUBO matrix for quadratic terms.
-    q_linear : np.ndarray of shape (n,)
-        Linear QUBO coefficients.
-
-    Returns:
-    -------
-    pauli_terms : List[Tuple[float, str]]
-        List of (coefficient, Pauli string) suitable for VQE or QAOA.
+    Important: the scalable solver below does not build full Pauli matrices.
+    Energy is computed from measured bitstrings and QUBO costs.
     """
-
     n = len(q_linear)
     term_dict = defaultdict(float)
 
-    # === Linear terms ===
     for i in range(n):
         q = q_linear[i]
         term_dict["I"] += q / 2.0
         term_dict[f"Z{i}"] += -q / 2.0
 
-    # === Quadratic terms ===
     for i in range(n):
         for j in range(i, n):
             qij = Q[i, j]
-            if abs(qij) < 1e-8:
+            if abs(qij) < 1e-12:
                 continue
 
             if i == j:
-                # z_i^2 = z_i (because z_i ∈ {0,1})
                 term_dict["I"] += qij / 2.0
                 term_dict[f"Z{i}"] += -qij / 2.0
             else:
-                # z_i z_j term
                 term_dict["I"] += qij / 4.0
                 term_dict[f"Z{i}"] += -qij / 4.0
                 term_dict[f"Z{j}"] += -qij / 4.0
                 term_dict[f"Z{i}Z{j}"] += qij / 4.0
 
-    # Clean and sort
-    return [(float(coeff), pauli) for pauli, coeff in sorted(term_dict.items()) if abs(coeff) > 1e-8]
+    return [
+        (float(coeff), pauli)
+        for pauli, coeff in sorted(term_dict.items())
+        if abs(coeff) > 1e-12
+    ]
+
 
 # ====================================================
-# 🧠 GRADIENT CALCULATION FUNCTIONS (Monolithic + Distributed)
+# PARAMETERIZED ANSATZ GENERATION
 # ====================================================
 
-
-def finite_difference_monolithic_gradient(param_values, pauli_terms, depth, n, epsilon=1e-3):
-    def grad_i(i):
-        shift = np.zeros_like(param_values)
-        shift[i] = epsilon
-
-        qc_plus = create_monolithic_ansatz(n, depth, param_values + shift)
-        qc_minus = create_monolithic_ansatz(n, depth, param_values - shift)
-
-        e_plus = compute_energy_monolithic(qc_plus, pauli_terms)
-        e_minus = compute_energy_monolithic(qc_minus, pauli_terms)
-
-        return (e_plus - e_minus) / (2 * epsilon)
-
-    grads = Parallel(n_jobs=-1)(delayed(grad_i)(i) for i in range(len(param_values)))
-    return np.array(grads)
-
-
-def finite_difference_gradient_parallel(
-    param_values: np.ndarray,
-    topo,
-    pauli_terms,
-    depth: int,
-    num_qpus: int,
-    qubits_per_qpu: int,
-    epsilon: float = 1e-3
-) -> np.ndarray:
-    """
-    Computes the gradient of the energy expectation with respect to each parameter
-    using central finite differences, in parallel.
-
-    Parameters:
-    ----------
-    param_values : np.ndarray
-        Current parameter values of the VQE ansatz (1D array).
-    topo : Topology
-        DISKIT Topology object representing the distributed QPU configuration.
-    pauli_terms : list
-        List of Pauli operators used to construct the Hamiltonian.
-    depth : int
-        Circuit depth (number of layers) in the variational ansatz.
-    num_qpus : int
-        Number of QPUs used in the distributed simulation.
-    qubits_per_qpu : int
-        Number of logical qubits assigned to each QPU.
-    epsilon : float, optional
-        Finite difference step size (default is 1e-3).
-
-    Returns:
-    -------
-    grads : np.ndarray
-        The gradient vector of the energy expectation w.r.t. parameters.
-    """
-
-    def grad_i(i: int) -> float:
-        """Computes the i-th component of the gradient using central difference."""
-        shift = np.zeros_like(param_values)
-        shift[i] = epsilon
-
-        e_plus = compute_energy_expectation(
-            param_values + shift, topo, pauli_terms, depth, num_qpus, qubits_per_qpu
-        )
-        e_minus = compute_energy_expectation(
-            param_values - shift, topo, pauli_terms, depth, num_qpus, qubits_per_qpu
-        )
-
-        return (e_plus - e_minus) / (2 * epsilon)
-
-    # Use joblib to parallelize gradient computation over all parameters
-    grads = Parallel(n_jobs=-1)(
-        delayed(grad_i)(i) for i in range(len(param_values))
-    )
-    
-    return np.array(grads)
-
-# ====================================================
-# 🧠 ANSATZ GENERATION FUNCTIONS
-# ====================================================
-
-def create_monolithic_ansatz(
+def create_monolithic_parameterized_ansatz(
     num_qubits: int,
     depth: int,
-    param_values: list
-) -> QuantumCircuit:
-    """
-    Creates a layered monolithic variational ansatz circuit with RX-RY rotations
-    and chain-like CX entanglement (bottom to top) between adjacent qubits.
-
-    Parameters:
-    ----------
-    num_qubits : int
-        Number of qubits in the circuit.
-    depth : int
-        Number of layers in the variational circuit.
-    param_values : list or np.ndarray
-        Flat list of rotation parameters, of length 2 * num_qubits * depth.
-
-    Returns:
-    -------
-    qc : QuantumCircuit
-        The constructed parameterized ansatz quantum circuit.
-    """
-
+) -> Tuple[QuantumCircuit, List[Parameter]]:
+    """Create a symbolic monolithic RX-RY ansatz."""
     qc = QuantumCircuit(num_qubits)
-    param_index = 0  # Index for accessing parameters
+    parameters = []
+    p = 0
 
     for d in range(depth):
-        # === Rotation Layer: Apply RY and RX to every qubit ===
         for q in range(num_qubits):
-            theta_ry = param_values[param_index]
-            theta_rx = param_values[param_index + 1]
-            param_index += 2
+            theta_ry = Parameter(f"theta_{p}")
+            p += 1
+            theta_rx = Parameter(f"theta_{p}")
+            p += 1
+
+            parameters.append(theta_ry)
+            parameters.append(theta_rx)
 
             qc.ry(theta_ry, q)
             qc.rx(theta_rx, q)
 
-        # === Entanglement Layer: Chain CXs (skip after final layer) ===
         if d < depth - 1:
             for i in reversed(range(1, num_qubits)):
                 qc.cx(i - 1, i)
 
-    return qc
+    return qc, parameters
 
 
-from qiskit.circuit import QuantumRegister, QuantumCircuit, Parameter
-
-def create_ansatz_on_topology_regs(
-    qregs: list,
+def create_distributed_parameterized_ansatz(
+    qregs: List[QuantumRegister],
     depth: int = 1,
     num_qpus: int = 2,
     cross_qpu_entangle: bool = True,
-    parametric: bool = False,
-    param_values: list = None
-) -> QuantumCircuit:
+) -> Tuple[QuantumCircuit, List[Parameter]]:
     """
-    Constructs a distributed variational ansatz circuit on a given list of 
-    quantum registers, optionally using symbolic parameters or fixed values.
+    Create a symbolic distributed ansatz on QPU registers.
 
-    Each layer consists of:
-    - Rotation layer (RY and RX per qubit)
-    - Optional entanglement (CX) between adjacent qubits in the flattened layout
-
-    Parameters:
-    ----------
-    qregs : list of QuantumRegister
-        List of quantum registers, typically representing subsystems or QPUs.
-        Communication registers (e.g., com_*) are ignored.
-    depth : int, optional
-        Number of repeated layers in the ansatz (default is 1).
-    num_qpus : int, optional
-        Number of logical QPUs (default is 2). Included for interface consistency.
-    cross_qpu_entangle : bool, optional
-        If True, entanglement across QPUs is allowed. Currently not used in logic.
-    parametric : bool, optional
-        If True, use symbolic Parameters for θ and ϕ rotations.
-    param_values : list, optional
-        List of numerical parameter values for all RY and RX gates.
-        Length must equal 2 * num_qubits * depth.
-
-    Returns:
-    -------
-    qc : QuantumCircuit
-        A quantum circuit with layered variational ansatz applied.
+    Communication registers whose names start with 'com_' are not directly
+    parameterized by the ansatz.
     """
-
     qc = QuantumCircuit(*qregs)
 
-    # Filter only system (computational) registers
     system_qregs = [reg for reg in qregs if not reg.name.startswith("com_")]
-
-    # Flatten all system qubits
     all_qubits = [q for reg in system_qregs for q in reg]
-    num_qubits = len(all_qubits)
-    total_params_needed = 2 * depth * num_qubits  # 2 params per qubit per layer
 
-    # Validate provided parameters
-    if param_values is not None and len(param_values) != total_params_needed:
-        raise ValueError(
-            f"[create_ansatz_on_topology_regs] Expected {total_params_needed} parameters, got {len(param_values)}"
-        )
-
-    param_index = 0      # For real-valued parameters
-    theta_index = 0      # For symbolic parameters (naming)
+    parameters = []
+    p = 0
 
     for d in range(depth):
-        # --- Rotation Layer (RY + RX) ---
         for q in all_qubits:
-            if parametric:
-                theta_ry = Parameter(f"θ{theta_index}")
-                theta_rx = Parameter(f"ϕ{theta_index}")
-                theta_index += 1
-            elif param_values is not None:
-                theta_ry = param_values[param_index]
-                theta_rx = param_values[param_index + 1]
-                param_index += 2
-            else:
-                theta_ry = np.pi / 8
-                theta_rx = np.pi / 8
+            theta_ry = Parameter(f"theta_{p}")
+            p += 1
+            theta_rx = Parameter(f"theta_{p}")
+            p += 1
+
+            parameters.append(theta_ry)
+            parameters.append(theta_rx)
 
             qc.ry(theta_ry, q)
             qc.rx(theta_rx, q)
 
-        # --- Skip entanglement after final layer ---
-        if d == depth - 1:
-            break
+        if d < depth - 1:
+            for i in range(len(all_qubits) - 1, 0, -1):
+                qc.cx(all_qubits[i - 1], all_qubits[i])
 
-        # --- Entanglement Layer (linear CXs) ---
-        for i in range(len(all_qubits) - 1, 0, -1):
-            qc.cx(all_qubits[i - 1], all_qubits[i])
-
-    return qc
+    return qc, parameters
 
 
+# ====================================================
+# NUMERIC ANSATZ FUNCTIONS KEPT FOR COMPATIBILITY
+# ====================================================
+
+def bind_parameter_values(
+    circuit: QuantumCircuit,
+    parameters: List[Parameter],
+    values: Union[List[float], np.ndarray],
+) -> QuantumCircuit:
+    """Bind numeric parameter values to a parameterized circuit."""
+    values = np.asarray(values, dtype=float)
+
+    if len(values) != len(parameters):
+        raise ValueError(f"Expected {len(parameters)} parameters, got {len(values)}.")
+
+    bind_dict = {p: float(v) for p, v in zip(parameters, values)}
+
+    try:
+        return circuit.assign_parameters(bind_dict, inplace=False)
+    except AttributeError:
+        return circuit.bind_parameters(bind_dict)
+
+
+def create_monolithic_ansatz(
+    num_qubits: int,
+    depth: int,
+    param_values: Union[List[float], np.ndarray],
+) -> QuantumCircuit:
+    """Create numeric monolithic RX-RY ansatz. Kept for compatibility."""
+    qc, parameters = create_monolithic_parameterized_ansatz(num_qubits, depth)
+    return bind_parameter_values(qc, parameters, param_values)
+
+
+def create_ansatz_on_topology_regs(
+    qregs: List[QuantumRegister],
+    depth: int = 1,
+    num_qpus: int = 2,
+    cross_qpu_entangle: bool = True,
+    parametric: bool = False,
+    param_values: Optional[Union[List[float], np.ndarray]] = None,
+) -> QuantumCircuit:
+    """Create distributed ansatz. Kept for compatibility with old code."""
+    qc, parameters = create_distributed_parameterized_ansatz(
+        qregs=qregs,
+        depth=depth,
+        num_qpus=num_qpus,
+        cross_qpu_entangle=cross_qpu_entangle,
+    )
+
+    if parametric or param_values is None:
+        return qc
+
+    return bind_parameter_values(qc, parameters, param_values)
 
 
 def remap_with_diskit(ansatz_qc: QuantumCircuit, topology: Topology) -> QuantumCircuit:
-    """
-    Applies DISKIT's circuit remapper to distribute a monolithic circuit
-    onto the specified topology of QPUs.
-
-    Parameters:
-    ----------
-    ansatz_qc : QuantumCircuit
-        The monolithic quantum circuit to be remapped.
-    topology : diskit.Topology
-        The distributed system topology specifying how qubits are divided.
-
-    Returns:
-    -------
-    QuantumCircuit
-        A remapped (distributed) version of the original circuit.
-    """
+    """Apply DISKIT circuit remapping."""
     remapper = CircuitRemapper(topology)
     return remapper.remap_circuit(ansatz_qc)
 
 
-def get_reduced_state(circuit: QuantumCircuit, sim=sim) -> DensityMatrix:
-    """
-    Simulates a circuit and returns the reduced density matrix by tracing out
-    all communication qubits (registers starting with 'com_').
-
-    Parameters:
-    ----------
-    circuit : QuantumCircuit
-        The full quantum circuit including system and communication qubits.
-    sim : Backend, optional
-        The simulator backend (default is Aer simulator).
-
-    Returns:
-    -------
-    DensityMatrix
-        The reduced density matrix after tracing out communication qubits.
-    """
-    # Copy circuit to avoid side effects and save final statevector
-    circuit_copy = circuit.copy()
-    circuit_copy.save_statevector()
-    job = assemble(circuit_copy)
-    state = sim.run(job).result().get_statevector()
-
-    # Find communication qubits (usually used for teleportation/EPR sharing)
-    comm_qubits = [
-        q for reg in circuit.qregs if reg.name.startswith("com_") for q in reg
-    ]
-    comm_indices = [circuit.find_bit(q).index for q in comm_qubits]
-
-    # Trace out communication qubits to get reduced state
-    return partial_trace(state, comm_indices)
-
 # ====================================================
-# ⚡ ENERGY EVALUATION FUNCTIONS (DISTRIBUTED & MONOLITHIC)
+# SAMPLING AND ENERGY UTILITIES
 # ====================================================
 
+def get_computational_qubits(circuit: QuantumCircuit, mode: str, n: int):
+    """Return only computational QUBO qubits; exclude communication qubits."""
+    if mode == "distributed":
+        comp_qubits = []
+        for reg in circuit.qregs:
+            if not reg.name.startswith("com_"):
+                comp_qubits.extend(reg)
+        return comp_qubits[:n]
 
-def compute_energy_monolithic(qc, pauli_terms):
-    qc_copy = qc.copy()
-    qc_copy.save_statevector()
-    sv = sim.run(assemble(qc_copy)).result().get_statevector()
+    return list(circuit.qubits[:n])
+
+
+def add_qubo_measurements_once(
+    circuit: QuantumCircuit,
+    mode: str,
+    n: int,
+) -> QuantumCircuit:
+    """Add measurements to a copy of the circuit once."""
+    measured = circuit.copy()
+    creg = ClassicalRegister(n, "qubo")
+    measured.add_register(creg)
+
+    comp_qubits = get_computational_qubits(measured, mode, n)
+
+    if len(comp_qubits) < n:
+        raise ValueError(f"Need {n} computational qubits, found {len(comp_qubits)}")
+
+    for i in range(n):
+        measured.measure(comp_qubits[i], creg[i])
+
+    return measured
+
+
+def normalize_counts_to_qubo_bits(counts_raw: Dict[str, int], n: int) -> Dict[str, int]:
+    """
+    Convert Qiskit count strings to QUBO bitstrings ordered as z[0], ..., z[n-1].
+    """
+    histogram = defaultdict(int)
+
+    for bitstring, count in counts_raw.items():
+        clean = bitstring.replace(" ", "")
+        bits_lsb_first = clean[::-1]
+        qubo_bits = bits_lsb_first[:n]
+        histogram[qubo_bits] += count
+
+    return dict(histogram)
+
+
+def estimate_energy_from_histogram(
+    histogram: Dict[str, int],
+    Q: np.ndarray,
+    q_linear: np.ndarray,
+) -> float:
+    """Estimate expected QUBO objective value from sampled bitstrings."""
+    total = sum(histogram.values())
+
+    if total <= 0:
+        raise RuntimeError("Empty histogram. Cannot estimate energy.")
+
     energy = 0.0
-    for coeff, term in pauli_terms:
-        if term == "I":
-            energy += coeff
+    for bstring, count in histogram.items():
+        z = np.array([int(b) for b in bstring], dtype=int)
+        energy += (count / total) * qubo_cost(z, Q, q_linear)
+
+    return float(energy)
+
+
+# ====================================================
+# CACHED + BATCHED CIRCUIT EVALUATOR
+# ====================================================
+
+class CachedCircuitEvaluator:
+    """
+    Builds quantum circuit infrastructure once and reuses it.
+
+    Cached once:
+    - topology
+    - QPU registers
+    - symbolic ansatz
+    - DISKIT remapped circuit
+    - measured circuit
+    - transpiled measured circuit, when possible
+    - parameter order
+
+    Repeated every energy call:
+    - bind parameter values
+    - run simulator
+    - compute sampled QUBO energy
+
+    Batched features:
+    - energies([...]) runs many parameter vectors in one backend call.
+    - spsa_pair_energy(theta_plus, theta_minus) runs SPSA pair in one backend call.
+    """
+
+    def __init__(
+        self,
+        mode: str,
+        Q: np.ndarray,
+        q_linear: np.ndarray,
+        depth: int,
+        qpu_qubit_config: Optional[List[int]],
+        backend=None,
+        transpile_once: bool = True,
+        transpile_optimization_level: int = 0,
+        batch_size: Optional[int] = None,
+    ):
+        self.mode = mode
+        self.Q = np.asarray(Q, dtype=float)
+        self.q_linear = np.asarray(q_linear, dtype=float)
+        self.depth = depth
+        self.n = len(self.q_linear)
+        self.backend = backend if backend is not None else sim
+        self.transpile_once = transpile_once
+        self.transpile_optimization_level = transpile_optimization_level
+        self.batch_size = batch_size
+
+        if self.Q.shape != (self.n, self.n):
+            raise ValueError(f"Q must have shape {(self.n, self.n)}, got {self.Q.shape}.")
+
+        self.topo, self.num_qpus, self.qpu_qubit_config = prepare_topology(
+            mode=self.mode,
+            n=self.n,
+            qpu_qubit_config=qpu_qubit_config,
+        )
+
+        self.base_circuit, self.parameters = self._build_base_parameterized_circuit()
+        self.measured_circuit = add_qubo_measurements_once(self.base_circuit, self.mode, self.n)
+        self.run_circuit_template = self._try_transpile_once(self.measured_circuit)
+
+    @property
+    def num_params(self) -> int:
+        return len(self.parameters)
+
+    def _build_base_parameterized_circuit(self) -> Tuple[QuantumCircuit, List[Parameter]]:
+        if self.mode == "monolithic":
+            return create_monolithic_parameterized_ansatz(self.n, self.depth)
+
+        if self.mode == "distributed":
+            qregs = self.topo.get_regs()
+            ansatz_qc, parameters = create_distributed_parameterized_ansatz(
+                qregs=qregs,
+                depth=self.depth,
+                num_qpus=self.num_qpus,
+            )
+
+            remapped_qc = remap_with_diskit(ansatz_qc, self.topo)
+            return remapped_qc, parameters
+
+        raise ValueError("mode must be 'monolithic' or 'distributed'.")
+
+    def _try_transpile_once(self, circuit: QuantumCircuit) -> QuantumCircuit:
+        if not self.transpile_once:
+            return circuit
+
+        try:
+            return transpile(
+                circuit,
+                backend=self.backend,
+                optimization_level=self.transpile_optimization_level,
+            )
+        except Exception:
+            return circuit
+
+    def bind(self, param_values: Union[List[float], np.ndarray]) -> QuantumCircuit:
+        return bind_parameter_values(self.run_circuit_template, self.parameters, param_values)
+
+    def bind_many(self, param_matrix: Union[List[np.ndarray], np.ndarray]) -> List[QuantumCircuit]:
+        """Bind many parameter vectors to the cached circuit template."""
+        param_matrix = np.asarray(param_matrix, dtype=float)
+
+        if param_matrix.ndim == 1:
+            param_matrix = param_matrix.reshape(1, -1)
+
+        if param_matrix.shape[1] != self.num_params:
+            raise ValueError(f"Expected parameter dimension {self.num_params}, got {param_matrix.shape[1]}.")
+
+        return [self.bind(row) for row in param_matrix]
+
+    def _run_circuit_batch(
+        self,
+        circuits: List[QuantumCircuit],
+        num_shots: int,
+    ):
+        """Run a list of circuits in one or multiple backend calls."""
+        if len(circuits) == 0:
+            return []
+
+        if self.batch_size is None or self.batch_size <= 0:
+            batch_size = len(circuits)
         else:
-            op = [np.eye(2)] * qc.num_qubits
-            if 'Z' in term:
-                labels = term.split('Z')
-                positions = [int(k) for k in labels[1:] if k != '']
-                for pos in positions:
-                    op[pos] = np.array([[1, 0], [0, -1]])
-            full_op = op[0]
-            for k in range(1, len(op)):
-                full_op = np.kron(full_op, op[k])
-            energy += coeff * np.real(np.vdot(sv.data, full_op @ sv.data))
+            batch_size = int(self.batch_size)
+
+        all_counts = []
+
+        for start in range(0, len(circuits), batch_size):
+            batch = circuits[start:start + batch_size]
+            result = self.backend.run(batch, shots=num_shots).result()
+
+            if len(batch) == 1:
+                all_counts.append(result.get_counts(0))
+            else:
+                for k in range(len(batch)):
+                    all_counts.append(result.get_counts(k))
+
+        return all_counts
+
+    def counts(
+        self,
+        param_values: Union[List[float], np.ndarray],
+        num_shots: int = 1024,
+    ) -> Dict[str, int]:
+        """Run one parameter vector and return normalized QUBO-bit histogram."""
+        return self.histograms([param_values], num_shots=num_shots)[0]
+
+    def histograms(
+        self,
+        param_matrix: Union[List[np.ndarray], np.ndarray],
+        num_shots: int = 1024,
+    ) -> List[Dict[str, int]]:
+        """Run many parameter vectors in batched backend calls."""
+        circuits = self.bind_many(param_matrix)
+        raw_counts_list = self._run_circuit_batch(circuits, num_shots=num_shots)
+        return [normalize_counts_to_qubo_bits(counts_raw, self.n) for counts_raw in raw_counts_list]
+
+    def energy(
+        self,
+        param_values: Union[List[float], np.ndarray],
+        num_shots: int = 1024,
+    ) -> float:
+        histogram = self.counts(param_values, num_shots=num_shots)
+        return estimate_energy_from_histogram(histogram, self.Q, self.q_linear)
+
+    def energies(
+        self,
+        param_matrix: Union[List[np.ndarray], np.ndarray],
+        num_shots: int = 1024,
+    ) -> np.ndarray:
+        """
+        Evaluate many candidate parameter vectors using batched backend calls.
+
+        This is used to speed up metaheuristic candidate population evaluations.
+        """
+        histograms = self.histograms(param_matrix, num_shots=num_shots)
+        energies = [estimate_energy_from_histogram(hist, self.Q, self.q_linear) for hist in histograms]
+        return np.asarray(energies, dtype=float)
+
+    def spsa_pair_energy(
+        self,
+        theta_plus: np.ndarray,
+        theta_minus: np.ndarray,
+        num_shots: int = 1024,
+    ) -> Tuple[float, float]:
+        """
+        Evaluate theta_plus and theta_minus in one backend call.
+
+        This reduces simulator/backend overhead compared to two separate calls.
+        """
+        energies = self.energies(np.vstack([theta_plus, theta_minus]), num_shots=num_shots)
+        return float(energies[0]), float(energies[1])
+
+    def energy_and_histogram(
+        self,
+        param_values: Union[List[float], np.ndarray],
+        num_shots: int = 1024,
+    ) -> Tuple[float, Dict[str, int]]:
+        histogram = self.counts(param_values, num_shots=num_shots)
+        energy = estimate_energy_from_histogram(histogram, self.Q, self.q_linear)
+        return energy, histogram
+
+    def circuit_with_bound_parameters(self, param_values: Union[List[float], np.ndarray]) -> QuantumCircuit:
+        """Return final bound measured circuit."""
+        return self.bind(param_values)
+
+    def circuit_without_measurements(self, param_values: Union[List[float], np.ndarray]) -> QuantumCircuit:
+        """Return final bound circuit without the measurement-added wrapper."""
+        return bind_parameter_values(self.base_circuit, self.parameters, param_values)
+
+
+# ====================================================
+# BACKWARD-COMPATIBLE ENERGY FUNCTION
+# ====================================================
+
+def compute_sampling_energy(
+    param_values: Union[List[float], np.ndarray],
+    Q: np.ndarray,
+    q_linear: np.ndarray,
+    mode: str,
+    depth: int,
+    n: int,
+    topo: Optional[Topology] = None,
+    num_qpus: int = 1,
+    num_shots: int = 1024,
+    backend=None,
+    return_circuit: bool = False,
+):
+    """
+    Backward-compatible one-shot sampling energy.
+
+    dvqe(...) does not use this inside its main loop.
+    """
+    qpu_config = [n]
+
+    evaluator = CachedCircuitEvaluator(
+        mode=mode,
+        Q=Q,
+        q_linear=q_linear,
+        depth=depth,
+        qpu_qubit_config=qpu_config,
+        backend=backend,
+        transpile_once=True,
+    )
+
+    energy, histogram = evaluator.energy_and_histogram(param_values, num_shots=num_shots)
+    circuit = evaluator.circuit_without_measurements(param_values)
+
+    if return_circuit:
+        return energy, circuit, histogram
 
     return energy
 
-def compute_energy_expectation(
-    param_values: Union[np.ndarray, List[float]],
-    topo,
-    pauli_terms: List[Tuple[float, str]],
-    depth: int,
-    num_qpus: int,
-    qubits_per_qpu: int,
-    return_circuit: bool = False
-) -> Union[float, Tuple[float, QuantumCircuit]]:
-    """
-    Computes the energy expectation ⟨H⟩ = ⟨ψ|H|ψ⟩ of a distributed circuit
-    under the given parameter values and topology using DISKIT.
-
-    Parameters:
-    ----------
-    param_values : array-like
-        Flat list of ansatz parameters (length = 2 * num_qubits * depth).
-    topo : diskit.Topology
-        The distributed system topology used to generate QPU registers.
-    pauli_terms : list of (float, str)
-        Hamiltonian terms as (coefficient, PauliString), e.g., [(0.5, "Z0Z1"), (-0.2, "I")].
-    depth : int
-        Number of ansatz layers.
-    num_qpus : int
-        Number of QPUs (used to set up the registers).
-    qubits_per_qpu : int
-        Number of qubits per QPU.
-    return_circuit : bool, optional
-        If True, also return the remapped distributed circuit.
-
-    Returns:
-    -------
-    energy : float
-        The expected energy ⟨ψ|H|ψ⟩ given the current ansatz parameters.
-
-    Optional:
-    --------
-    If return_circuit is True:
-        (energy, distributed_circuit) is returned.
-    """
-
-    # === Step 1: Build parameterized ansatz circuit on QPU registers ===
-    qregs = topo.get_regs()
-    ansatz_qc = create_ansatz_on_topology_regs(
-        qregs,
-        depth=depth,
-        num_qpus=num_qpus,
-        param_values=param_values
-    )
-
-    # === Step 2: Remap circuit using DISKIT to distributed layout ===
-    dist_qc = remap_with_diskit(ansatz_qc, topo)
-
-    # === Step 3: Simulate and get reduced state (excluding communication qubits) ===
-    reduced_dm: DensityMatrix = get_reduced_state(dist_qc, sim)
-
-    # === Step 4: Compute ⟨H⟩ = Σ c_i ⟨ψ|P_i|ψ⟩ ===
-    energy = 0.0
-    for coeff, term in pauli_terms:
-        if term == "I":
-            energy += coeff
-            continue
-
-        # Construct full n-qubit operator from tensor product of I/Z
-        num_qubits = reduced_dm.num_qubits
-        ops = [np.eye(2)] * num_qubits
-
-        # Parse indices from Pauli string like "Z0Z2"
-        z_indices = [int(idx) for idx in term.replace('Z', ' ').split() if idx != '']
-        for idx in z_indices:
-            ops[idx] = np.array([[1, 0], [0, -1]])  # Pauli-Z
-
-        # Build full Pauli operator via Kronecker product
-        full_op = ops[0]
-        for op in ops[1:]:
-            full_op = np.kron(full_op, op)
-
-        # Compute trace(ρ * H)
-        energy += coeff * np.real(np.trace(reduced_dm.data @ full_op))
-
-    return (energy, dist_qc) if return_circuit else energy
 
 # ====================================================
-# 🔁 CLASSICAL OPTIMIZER UTILITIES
+# SPSA OPTIMIZER
 # ====================================================
 
-class AdamOptimizer:
+class SPSAOptimizer:
     """
-    Implements the Adam optimization algorithm for parameter updates.
-    
-    This optimizer is commonly used in variational quantum algorithms like VQE
-    to update ansatz parameters based on gradients of the energy function.
+    SPSA optimizer.
 
-    Attributes:
-    ----------
-    lr : float
-        Learning rate (step size).
-    beta1 : float
-        Exponential decay rate for the first moment estimate (momentum).
-    beta2 : float
-        Exponential decay rate for the second moment estimate (RMS).
-    epsilon : float
-        Small constant to avoid division by zero.
-    m : np.ndarray
-        First moment vector (initialized during first step).
-    v : np.ndarray
-        Second moment vector (initialized during first step).
-    t : int
-        Time step counter (starts from 0).
+    It uses two energy evaluations per iteration, independent of the number of
+    variational parameters. In dvqe(...), the two evaluations are batched into
+    one backend call through evaluator.spsa_pair_energy(...).
     """
 
-    def __init__(self, lr=0.01, beta1=0.9, beta2=0.999, epsilon=1e-8):
-        self.lr = lr
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.epsilon = epsilon
-        self.m = None  # First moment (mean of gradients)
-        self.v = None  # Second moment (uncentered variance of gradients)
-        self.t = 0     # Iteration counter
+    def __init__(
+        self,
+        a: float = 0.1,
+        c: float = 0.15,
+        alpha: float = 0.602,
+        gamma: float = 0.101,
+        A: float = 10.0,
+        seed: Optional[int] = None,
+    ):
+        self.a = a
+        self.c = c
+        self.alpha = alpha
+        self.gamma = gamma
+        self.A = A
+        self.rng = np.random.default_rng(seed)
 
-    def step(self, grads: np.ndarray) -> np.ndarray:
-        """
-        Computes the Adam update step for the given gradient.
+    def gains(self, k: int) -> Tuple[float, float]:
+        ak = self.a / ((k + 1 + self.A) ** self.alpha)
+        ck = self.c / ((k + 1) ** self.gamma)
+        return ak, ck
 
-        Parameters:
-        ----------
-        grads : np.ndarray
-            The gradient of the objective function w.r.t. parameters.
+    def perturb(self, theta: np.ndarray, k: int):
+        """Create SPSA theta_plus/theta_minus pair."""
+        theta = np.asarray(theta, dtype=float)
+        ak, ck = self.gains(k)
+        delta = self.rng.choice([-1.0, 1.0], size=theta.shape)
 
-        Returns:
-        -------
-        update : np.ndarray
-            The computed parameter update to apply.
-        """
+        theta_plus = np.mod(theta + ck * delta, 2 * np.pi)
+        theta_minus = np.mod(theta - ck * delta, 2 * np.pi)
 
-        if self.m is None:
-            # Initialize first and second moment vectors on first call
-            self.m = np.zeros_like(grads)
-            self.v = np.zeros_like(grads)
+        return ak, ck, delta, theta_plus, theta_minus
 
-        # Update time step
-        self.t += 1
+    def update_from_pair(
+        self,
+        theta: np.ndarray,
+        ak: float,
+        ck: float,
+        delta: np.ndarray,
+        e_plus: float,
+        e_minus: float,
+    ):
+        """Compute SPSA update after batched energy evaluation."""
+        gradient_estimate = ((e_plus - e_minus) / (2.0 * ck)) * delta
+        update = -ak * gradient_estimate
+        theta_new = np.mod(theta + update, 2 * np.pi)
+        return theta_new, update
 
-        # Update biased moments
-        self.m = self.beta1 * self.m + (1 - self.beta1) * grads
-        self.v = self.beta2 * self.v + (1 - self.beta2) * (grads ** 2)
+    def step(self, theta: np.ndarray, k: int, evaluator: CachedCircuitEvaluator, num_shots: int):
+        """One SPSA step with theta_plus/theta_minus executed in one backend call."""
+        ak, ck, delta, theta_plus, theta_minus = self.perturb(theta, k)
+        e_plus, e_minus = evaluator.spsa_pair_energy(theta_plus, theta_minus, num_shots=num_shots)
+        theta_new, update = self.update_from_pair(theta, ak, ck, delta, e_plus, e_minus)
+        return theta_new, update, float(e_plus), float(e_minus), theta_plus, theta_minus
 
-        # Bias correction
-        m_hat = self.m / (1 - self.beta1 ** self.t)
-        v_hat = self.v / (1 - self.beta2 ** self.t)
 
-        # Compute parameter update
-        update = -self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
-        return update
-
-        
 # ====================================================
-# 🌌 METAHEURISTIC-BASED VQE INITIALIZATION STRATEGIES
+# REDUCED-COST BATCHED METAHEURISTIC INITIALIZERS
 # ====================================================
-
 
 def black_hole_optimize_vqe(
-    topo,
-    pauli_terms,
-    depth,
-    num_qpus,
-    num_params,
-    N=10,
-    max_iter=100,
-    mode="distributed"
-):
-    low, high = 0.0, 2 * np.pi
-    stars = np.random.uniform(low, high, size=(N, num_params))
-    energies = np.zeros(N)
-    n = num_params // (2 * depth)
+    evaluator: CachedCircuitEvaluator,
+    num_params: int,
+    N: int = 4,
+    max_iter: int = 8,
+    num_shots: int = 256,
+) -> np.ndarray:
+    """Reduced-cost Black Hole initialization using batched population evaluation."""
+    N = max(1, int(N))
+    max_iter = max(0, int(max_iter))
 
-    for i in range(N):
-        if mode == "distributed":
-            energies[i], _ = compute_energy_expectation(stars[i], topo, pauli_terms, depth, num_qpus, num_params, return_circuit=True)
-        else:
-            qc = create_monolithic_ansatz(n, depth, stars[i])
-            energies[i] = compute_energy_monolithic(qc, pauli_terms)
+    stars = np.random.uniform(0, 2 * np.pi, size=(N, num_params))
+    energies = evaluator.energies(stars, num_shots=num_shots)
 
-    for it in range(max_iter):
-        bh_index = np.argmin(energies)
+    for _ in range(max_iter):
+        bh_index = int(np.argmin(energies))
         bh = stars[bh_index].copy()
         bh_energy = energies[bh_index]
-        r_event = bh_energy / (np.sum(energies) + 1e-8)
+        r_event = abs(bh_energy) / (np.sum(np.abs(energies)) + 1e-8)
+
+        candidate_indices = []
+        candidate_params = []
 
         for i in range(N):
             if i == bh_index:
                 continue
-            stars[i] += random.uniform(0, 1) * (bh - stars[i])
-            stars[i] = np.clip(stars[i], low, high)
+
+            stars[i] = np.mod(stars[i] + random.random() * (bh - stars[i]), 2 * np.pi)
 
             if np.linalg.norm(stars[i] - bh) < r_event:
-                stars[i] = np.random.uniform(low, high, size=num_params)
+                stars[i] = np.random.uniform(0, 2 * np.pi, size=num_params)
 
-            if mode == "distributed":
-                energies[i], _ = compute_energy_expectation(stars[i], topo, pauli_terms, depth, num_qpus, num_params, return_circuit=True)
-            else:
-                qc = create_monolithic_ansatz(n, depth, stars[i])
-                energies[i] = compute_energy_monolithic(qc, pauli_terms)
+            candidate_indices.append(i)
+            candidate_params.append(stars[i].copy())
 
-    return stars[np.argmin(energies)]
+        if candidate_params:
+            new_energies = evaluator.energies(np.asarray(candidate_params), num_shots=num_shots)
+            for idx, e in zip(candidate_indices, new_energies):
+                energies[idx] = e
+
+    return stars[int(np.argmin(energies))]
+
 
 def gwo_optimize_vqe(
-    topo,
-    pauli_terms,
-    depth,
-    num_qpus,
-    num_params,
-    N=10,
-    max_iter=100,
-    mode="distributed"
-):
-    low, high = 0.0, 2 * np.pi
-    wolves = np.random.uniform(low, high, size=(N, num_params))
-    energies = np.zeros(N)
-    n = num_params // (2 * depth)
+    evaluator: CachedCircuitEvaluator,
+    num_params: int,
+    N: int = 5,
+    max_iter: int = 8,
+    num_shots: int = 256,
+) -> np.ndarray:
+    """Reduced-cost Grey Wolf Optimizer initialization using batched population evaluation."""
+    N = max(5, int(N))
+    max_iter = max(0, int(max_iter))
 
-    for i in range(N):
-        if mode == "distributed":
-            energies[i], _ = compute_energy_expectation(wolves[i], topo, pauli_terms, depth, num_qpus, num_params, return_circuit=True)
-        else:
-            qc = create_monolithic_ansatz(n, depth, wolves[i])
-            energies[i] = compute_energy_monolithic(qc, pauli_terms)
+    wolves = np.random.uniform(0, 2 * np.pi, size=(N, num_params))
+    energies = evaluator.energies(wolves, num_shots=num_shots)
 
     for t in range(max_iter):
         sorted_idx = np.argsort(energies)
-        alpha, beta, delta = wolves[sorted_idx[:3]]
-        a = 2 - 2 * (t / max_iter)
+        alpha = wolves[sorted_idx[0]].copy()
+        beta = wolves[sorted_idx[1]].copy()
+        delta = wolves[sorted_idx[2]].copy()
+
+        a = 2.0 - 2.0 * (t / max_iter) if max_iter > 0 else 0.0
+
+        new_wolves = np.zeros_like(wolves)
 
         for i in range(N):
-            X1 = X2 = X3 = np.zeros(num_params)
-            for j in range(num_params):
-                for leader, X in zip([alpha, beta, delta], [X1, X2, X3]):
-                    r1, r2 = random.random(), random.random()
-                    A = 2 * a * r1 - a
-                    C = 2 * r2
-                    D = abs(C * leader[j] - wolves[i][j])
-                    X[j] = leader[j] - A * D
-            wolves[i] = np.clip((X1 + X2 + X3) / 3, low, high)
+            r1 = np.random.rand(num_params)
+            r2 = np.random.rand(num_params)
+            A1 = 2 * a * r1 - a
+            C1 = 2 * r2
+            X1 = alpha - A1 * np.abs(C1 * alpha - wolves[i])
 
-            if mode == "distributed":
-                energies[i], _ = compute_energy_expectation(wolves[i], topo, pauli_terms, depth, num_qpus, num_params, return_circuit=True)
-            else:
-                qc = create_monolithic_ansatz(n, depth, wolves[i])
-                energies[i] = compute_energy_monolithic(qc, pauli_terms)
+            r1 = np.random.rand(num_params)
+            r2 = np.random.rand(num_params)
+            A2 = 2 * a * r1 - a
+            C2 = 2 * r2
+            X2 = beta - A2 * np.abs(C2 * beta - wolves[i])
 
-    return wolves[np.argmin(energies)]
+            r1 = np.random.rand(num_params)
+            r2 = np.random.rand(num_params)
+            A3 = 2 * a * r1 - a
+            C3 = 2 * r2
+            X3 = delta - A3 * np.abs(C3 * delta - wolves[i])
+
+            new_wolves[i] = np.mod((X1 + X2 + X3) / 3.0, 2 * np.pi)
+
+        wolves = new_wolves
+        energies = evaluator.energies(wolves, num_shots=num_shots)
+
+    return wolves[int(np.argmin(energies))]
+
 
 def abc_optimize_vqe(
-    topo,
-    pauli_terms,
-    depth,
-    num_qpus,
-    num_params,
-    N=10,
-    max_iter=100,
-    limit=5,
-    mode="distributed"
-):
-    low, high = 0.0, 2 * np.pi
-    food = np.random.uniform(low, high, size=(N, num_params))
-    fitness = np.zeros(N)
+    evaluator: CachedCircuitEvaluator,
+    num_params: int,
+    N: int = 5,
+    max_iter: int = 8,
+    limit: int = 3,
+    num_shots: int = 256,
+) -> np.ndarray:
+    """Reduced-cost Artificial Bee Colony initialization using batched candidate evaluation."""
+    N = max(5, int(N))
+    max_iter = max(0, int(max_iter))
+    limit = max(1, int(limit))
+
+    food = np.random.uniform(0, 2 * np.pi, size=(N, num_params))
+    fitness = evaluator.energies(food, num_shots=num_shots)
     trial = np.zeros(N)
-    n = num_params // (2 * depth)
 
-    for i in range(N):
-        if mode == "distributed":
-            fitness[i], _ = compute_energy_expectation(food[i], topo, pauli_terms, depth, num_qpus, num_params, return_circuit=True)
-        else:
-            qc = create_monolithic_ansatz(n, depth, food[i])
-            fitness[i] = compute_energy_monolithic(qc, pauli_terms)
-
-    for it in range(max_iter):
+    for _ in range(max_iter):
+        # Employed bees: build all candidates first, then evaluate as one batch.
+        employed_candidates = []
         for i in range(N):
             k = np.random.choice([j for j in range(N) if j != i])
             phi = np.random.uniform(-1, 1, size=num_params)
-            v = np.clip(food[i] + phi * (food[i] - food[k]), low, high)
+            v = np.mod(food[i] + phi * (food[i] - food[k]), 2 * np.pi)
+            employed_candidates.append(v)
 
-            if mode == "distributed":
-                energy, _ = compute_energy_expectation(v, topo, pauli_terms, depth, num_qpus, num_params, return_circuit=True)
-            else:
-                qc = create_monolithic_ansatz(n, depth, v)
-                energy = compute_energy_monolithic(qc, pauli_terms)
+        employed_candidates = np.asarray(employed_candidates)
+        employed_energies = evaluator.energies(employed_candidates, num_shots=num_shots)
 
-            if energy < fitness[i]:
-                food[i] = v
-                fitness[i] = energy
+        for i in range(N):
+            if employed_energies[i] < fitness[i]:
+                food[i] = employed_candidates[i]
+                fitness[i] = employed_energies[i]
                 trial[i] = 0
             else:
                 trial[i] += 1
 
-        prob = fitness.max() - fitness + 1e-8
-        prob /= prob.sum()
+        weights = fitness.max() - fitness + 1e-8
+        probs = weights / weights.sum() if weights.sum() > 0 else np.ones(N) / N
 
-        for _ in range(N):
-            i = np.random.choice(N, p=prob)
+        # Onlooker bees: build all candidates first, then evaluate as one batch.
+        onlooker_indices = []
+        onlooker_candidates = []
+
+        for _bee in range(N):
+            i = np.random.choice(N, p=probs)
             k = np.random.choice([j for j in range(N) if j != i])
             phi = np.random.uniform(-1, 1, size=num_params)
-            v = np.clip(food[i] + phi * (food[i] - food[k]), low, high)
+            v = np.mod(food[i] + phi * (food[i] - food[k]), 2 * np.pi)
+            onlooker_indices.append(i)
+            onlooker_candidates.append(v)
 
-            if mode == "distributed":
-                energy, _ = compute_energy_expectation(v, topo, pauli_terms, depth, num_qpus, num_params, return_circuit=True)
+        onlooker_candidates = np.asarray(onlooker_candidates)
+        onlooker_energies = evaluator.energies(onlooker_candidates, num_shots=num_shots)
+
+        for idx, v, energy in zip(onlooker_indices, onlooker_candidates, onlooker_energies):
+            if energy < fitness[idx]:
+                food[idx] = v
+                fitness[idx] = energy
+                trial[idx] = 0
             else:
-                qc = create_monolithic_ansatz(n, depth, v)
-                energy = compute_energy_monolithic(qc, pauli_terms)
+                trial[idx] += 1
 
-            if energy < fitness[i]:
-                food[i] = v
-                fitness[i] = energy
-                trial[i] = 0
-            else:
-                trial[i] += 1
+        # Scout bees: evaluate replacement scouts in one batch.
+        scout_indices = [i for i in range(N) if trial[i] >= limit]
+        if scout_indices:
+            scouts = np.random.uniform(0, 2 * np.pi, size=(len(scout_indices), num_params))
+            scout_energies = evaluator.energies(scouts, num_shots=num_shots)
 
-        for i in range(N):
-            if trial[i] >= limit:
-                food[i] = np.random.uniform(low, high, size=num_params)
-                if mode == "distributed":
-                    fitness[i], _ = compute_energy_expectation(food[i], topo, pauli_terms, depth, num_qpus, num_params, return_circuit=True)
-                else:
-                    qc = create_monolithic_ansatz(n, depth, food[i])
-                    fitness[i] = compute_energy_monolithic(qc, pauli_terms)
+            for local_idx, i in enumerate(scout_indices):
+                food[i] = scouts[local_idx]
+                fitness[i] = scout_energies[local_idx]
                 trial[i] = 0
 
-    return food[np.argmin(fitness)]
+    return food[int(np.argmin(fitness))]
 
-# ===========================================
-# 🧠 SOLUTION DECODING AND SELECTION UTILITIES
-# ===========================================
 
-def sample_final_solution(
-    final_circuit: QuantumCircuit,
+# ====================================================
+# FINAL SOLUTION DECODING
+# ====================================================
+
+def best_solution_from_histogram(
+    histogram: Dict[str, int],
     Q: np.ndarray,
     q_linear: np.ndarray,
-    qubo_indices: list,
-    qpu_qubit_config: list,
-    mode: str = "monolithic",
-    num_shots: int = 4000,
     top_k: int = 100,
-    return_histogram: bool = True,
-) -> Tuple[np.ndarray, float, Optional[Dict[str, int]]]:
-    """
-    Samples from the final circuit (distributed or monolithic) and returns
-    the best binary solution based on QUBO cost. Communication qubits are
-    excluded from measurement and histogram processing.
-
-    Parameters:
-    - final_circuit: full circuit (with or without communication qubits)
-    - Q, q_linear: QUBO cost matrices
-    - qubo_indices: indices of qubits used in QUBO (length = n)
-    - qpu_qubit_config: list of #qubits per QPU (only used in distributed)
-    - mode: "distributed" or "monolithic"
-
-    Returns:
-    - z_best: best binary solution
-    - cost_best: corresponding QUBO cost
-    - histogram: measured counts (only for computational bits)
-    """
-    n = len(qubo_indices)
-    measured_circuit = final_circuit.copy()
-
-    if mode == "distributed":
-        # === 1. Collect only computational qubits ===
-        comp_qubits = []
-        for reg in measured_circuit.qregs:
-            if not reg.name.startswith("com_"):
-                comp_qubits.extend(reg)
-
-        # === 2. Add classical register to match comp_qubits ===
-        from qiskit import ClassicalRegister
-        creg = ClassicalRegister(n, "creg")
-        measured_circuit.add_register(creg)
-
-        # === 3. Measure ONLY computational qubits ===
-        for i in range(n):
-            measured_circuit.measure(comp_qubits[i], creg[i])
-
-    else:  # Monolithic
-        if not measured_circuit.cregs:
-            measured_circuit.measure_all()
-
-    # === 4. Execute full circuit (including com_ qubits, but only comp measured) ===
-    backend = Aer.get_backend("qasm_simulator")
-    result = execute(measured_circuit, backend=backend, shots=num_shots).result()
-    counts_raw = result.get_counts()
-
-    # === 5. Histogram: only keep creg values (not full bitstring) ===
-    # Qiskit returns a bitstring with bits from all cregs + creg ordering reversed
-    histogram = {}
-    for bitstring, count in counts_raw.items():
-        bits = bitstring.replace(" ", "")[::-1]  # LSB first
-        trimmed = bits[-n:]                     # only last n bits → computational
-        histogram[trimmed] = count
-
-    # === 6. Evaluate QUBO cost on top_k most frequent ===
-    sorted_counts = sorted(histogram.items(), key=lambda x: -x[1])[:top_k]
+) -> Tuple[np.ndarray, float]:
+    """Return best QUBO solution among the top-k most frequent samples."""
+    sorted_counts = sorted(histogram.items(), key=lambda item: -item[1])[:top_k]
     best_cost = float("inf")
     z_best = None
 
-    for bstring, _ in sorted_counts:
-        z = np.array([int(b) for b in bstring])
-        cost = z.T @ Q @ z + q_linear @ z
+    for bstring, _count in sorted_counts:
+        z = np.array([int(b) for b in bstring], dtype=int)
+        cost = qubo_cost(z, Q, q_linear)
+
         if cost < best_cost:
             best_cost = cost
             z_best = z
@@ -874,133 +809,264 @@ def sample_final_solution(
     if z_best is None:
         raise RuntimeError("No valid QUBO solution found from measured bitstrings.")
 
-    return (z_best, best_cost, histogram) if return_histogram else (z_best, best_cost)
+    return z_best, float(best_cost)
 
 
-# ===========================================
-# 🚀 VQE MAIN EXECUTION CONTROLLER
-# ===========================================
-
-    
-
-def DVQE(
-    mode: str,                           # "monolithic" or "distributed"
-    Q: np.ndarray,                      # Full QUBO matrix (not yet used, for future)
-    q_linear: np.ndarray,              # Linear QUBO coefficients
-    init_type: int,                    # 1=random, 2=BH, 3=GWO, 4=ABC
-    depth: int,                        # Ansatz circuit depth
-    lr: float,                         # Learning rate
-    max_iters: int,                    # Number of optimization steps
-    qpu_qubit_config: list,           # QPUs configuration (used if mode = distributed)
-    rel_tol: float                     # Convergence threshold
-) -> np.ndarray:
+def sample_final_solution(
+    final_circuit: QuantumCircuit,
+    Q: np.ndarray,
+    q_linear: np.ndarray,
+    qubo_indices: Optional[List[int]] = None,
+    qpu_qubit_config: Optional[List[int]] = None,
+    mode: str = "monolithic",
+    num_shots: int = 4000,
+    top_k: int = 100,
+    return_histogram: bool = True,
+):
     """
-    General-purpose VQE runner that supports both monolithic and distributed modes.
+    Backward-compatible final sampler.
+
+    This function does not use the cached evaluator. dvqe(...) uses the cached
+    evaluator directly for final sampling.
+    """
+    n = len(q_linear) if qubo_indices is None else len(qubo_indices)
+
+    measured = add_qubo_measurements_once(final_circuit, mode, n)
+    result = sim.run(measured, shots=num_shots).result()
+    counts_raw = result.get_counts()
+    histogram = normalize_counts_to_qubo_bits(counts_raw, n)
+
+    z_best, best_cost = best_solution_from_histogram(histogram, Q, q_linear, top_k=top_k)
+
+    if return_histogram:
+        return z_best, best_cost, histogram
+
+    return z_best, best_cost
+
+
+# ====================================================
+# TOPOLOGY AND INITIALIZATION HELPERS
+# ====================================================
+
+def prepare_topology(mode: str, n: int, qpu_qubit_config: Optional[List[int]]):
+    """Prepare DISKIT topology for distributed mode."""
+    if mode == "monolithic":
+        return None, 1, [n]
+
+    if qpu_qubit_config is None:
+        raise ValueError("qpu_qubit_config is required for distributed mode.")
+
+    if sum(qpu_qubit_config) < n:
+        raise ValueError(
+            f"QPU config provides insufficient qubits: need {n}, got {sum(qpu_qubit_config)}"
+        )
+
+    cumulative = 0
+    adjusted = []
+
+    for q in qpu_qubit_config:
+        if cumulative + q <= n:
+            adjusted.append(q)
+            cumulative += q
+        else:
+            adjusted.append(n - cumulative)
+            break
+
+    adjusted = [q for q in adjusted if q > 0]
+    num_qpus = len(adjusted)
+
+    topo = Topology()
+    topo.create_qmap(num_qpus, adjusted)
+
+    return topo, num_qpus, adjusted
+
+
+def initialize_parameters(
+    init_type: int,
+    evaluator: CachedCircuitEvaluator,
+    warm_start_population: int,
+    warm_start_iters: int,
+    warm_start_shots: int,
+) -> np.ndarray:
+    """Initialize ansatz parameters using cached and batched evaluator."""
+    num_params = evaluator.num_params
+
+    if init_type == 1:
+        return np.random.uniform(0, 2 * np.pi, size=num_params)
+
+    if init_type == 2:
+        return black_hole_optimize_vqe(
+            evaluator=evaluator,
+            num_params=num_params,
+            N=warm_start_population,
+            max_iter=warm_start_iters,
+            num_shots=warm_start_shots,
+        )
+
+    if init_type == 3:
+        return gwo_optimize_vqe(
+            evaluator=evaluator,
+            num_params=num_params,
+            N=max(5, warm_start_population),
+            max_iter=warm_start_iters,
+            num_shots=warm_start_shots,
+        )
+
+    if init_type == 4:
+        return abc_optimize_vqe(
+            evaluator=evaluator,
+            num_params=num_params,
+            N=max(5, warm_start_population),
+            max_iter=warm_start_iters,
+            num_shots=warm_start_shots,
+        )
+
+    raise ValueError("Invalid init_type. Use 1=random, 2=BH, 3=GWO, 4=ABC.")
+
+
+# ====================================================
+# MAIN LOWERCASE SOLVER
+# ====================================================
+
+def dvqe(
+    mode: str,
+    Q: np.ndarray,
+    q_linear: np.ndarray,
+    init_type: int,
+    depth: int,
+    lr: float,
+    max_iters: int,
+    qpu_qubit_config: Optional[List[int]],
+    rel_tol: float,
+    num_shots: int = 1024,
+    final_shots: int = 4000,
+    spsa_c: float = 0.15,
+    spsa_A: float = 10.0,
+    warm_start_population: int = 4,
+    warm_start_iters: int = 8,
+    warm_start_shots: int = 256,
+    seed: Optional[int] = None,
+    verbose: bool = True,
+    transpile_once: bool = True,
+    transpile_optimization_level: int = 0,
+    batch_size: Optional[int] = None,
+):
+    """
+    Cached and batched scalable DVQE solver with lowercase name: dvqe(...)
 
     Parameters:
     - mode: "monolithic" or "distributed"
-    - Q, q_linear: QUBO matrix and linear coefficients
-    - init_type: 1=random, 2=BH, 3=GWO, 4=ABC
+    - Q: QUBO matrix
+    - q_linear: linear QUBO vector
+    - init_type: 1=random, 2=Black Hole, 3=GWO, 4=ABC
     - depth: ansatz depth
-    - lr: learning rate for Adam
-    - max_iters: max iterations
-    - qpu_qubit_config: list of ints for QPU qubit allocation (used in distributed)
-    - rel_tol: max |Δparam| stopping condition
+    - lr: SPSA learning-rate scale
+    - max_iters: number of SPSA iterations
+    - qpu_qubit_config: QPU qubit allocation for distributed mode
+    - rel_tol: stopping tolerance based on max parameter update
+    - batch_size: optional maximum number of circuits per backend run
 
     Returns:
-    - z_best: best binary solution found
+    - z_best
+    - final_circuit_without_measurements
+    - hist
     """
-
-    n = len(q_linear)
-    num_params = 2 * n * depth
-    numsol = 100
-    if n > 7:
-        numsol = int(np.floor(n / 1.5) * 100)
-
-
-    pauli_terms = qubo_to_pauli_hamiltonian(Q, q_linear)
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
 
     if mode not in ["monolithic", "distributed"]:
         raise ValueError("Invalid mode. Use 'monolithic' or 'distributed'.")
 
-    if mode == "distributed":
-        if sum(qpu_qubit_config) < n:
-            raise ValueError(f"QPU config provides insufficient qubits: need {n}, got {sum(qpu_qubit_config)}")
+    Q = np.asarray(Q, dtype=float)
+    q_linear = np.asarray(q_linear, dtype=float)
+    n = len(q_linear)
 
-        # Adjust config to fit n qubits exactly
-        cumulative, adjusted = 0, []
-        for q in qpu_qubit_config:
-            if cumulative + q <= n:
-                adjusted.append(q)
-                cumulative += q
-            else:
-                adjusted.append(n - cumulative)
-                break
-        qpu_qubit_config = [q for q in adjusted if q > 0]
-        num_qpus = len(qpu_qubit_config)
+    if Q.shape != (n, n):
+        raise ValueError(f"Q must have shape {(n, n)}, but got {Q.shape}.")
 
-        # Build topology
-        topo = Topology()
-        topo.create_qmap(num_qpus, qpu_qubit_config)
-    else:
-        topo = None  # So that the call to the optimizer is well-formed
-        num_qpus = 1  # dummy placeholder for argument consistency
+    top_k = 100 if n <= 7 else int(np.floor(n / 1.5) * 100)
 
-    # Initialize parameters
-    if init_type == 1:
-        param_values = np.random.uniform(0, 2 * np.pi, size=num_params)
-    elif init_type == 2:
-        param_values = black_hole_optimize_vqe(topo, pauli_terms, depth, num_qpus, num_params, mode=mode)
-    elif init_type == 3:
-        param_values = gwo_optimize_vqe(topo, pauli_terms, depth, num_qpus, num_params, mode=mode)
-    elif init_type == 4:
-        param_values = abc_optimize_vqe(topo, pauli_terms, depth, num_qpus, num_params, mode=mode)
-    else:
-        raise ValueError("Invalid init_type")
-
-    # Setup optimizer and memory
-    opt = AdamOptimizer(lr=lr)
-    feasible_solutions = []
-
-    for it in range(max_iters):
-        if mode == "distributed":
-            energy, dist_qc = compute_energy_expectation(param_values, topo, pauli_terms, depth, num_qpus, num_params, return_circuit=True)
-            reduced_state = get_reduced_state(dist_qc, sim)
-            final_state = reduced_state.data[:, 0]
-        else:
-            # Monolithic mode
-            mono_qc = create_monolithic_ansatz(n, depth, param_values)
-            energy = compute_energy_monolithic(mono_qc, pauli_terms)
-            final_state = Statevector(mono_qc).data  # You could simulate instead
-
-        # Update params
-        if mode == "distributed":
-            grads = finite_difference_gradient_parallel(param_values, topo, pauli_terms, depth, num_qpus, num_params)
-        else:
-            grads = finite_difference_monolithic_gradient(param_values, pauli_terms, depth, n)
-
-        update = opt.step(grads)
-        param_values += update
-
-        if it > 2 and np.abs(update).max() < rel_tol:
-            break
-
-    final_circuit = dist_qc if mode == "distributed" else mono_qc
-
-    z_best, cost_best, hist = sample_final_solution(
-        final_circuit=final_circuit,
+    # Build everything structural once.
+    evaluator = CachedCircuitEvaluator(
+        mode=mode,
         Q=Q,
         q_linear=q_linear,
-        qubo_indices=list(range(len(q_linear))),  # or just: list(range(n))
+        depth=depth,
         qpu_qubit_config=qpu_qubit_config,
-        mode=mode,
-        num_shots=1000,
-        top_k=numsol,
-        return_histogram=True
+        backend=sim,
+        transpile_once=transpile_once,
+        transpile_optimization_level=transpile_optimization_level,
+        batch_size=batch_size,
     )
 
+    # Initialize once, using cached + batched evaluator for metaheuristics.
+    param_values = initialize_parameters(
+        init_type=init_type,
+        evaluator=evaluator,
+        warm_start_population=warm_start_population,
+        warm_start_iters=warm_start_iters,
+        warm_start_shots=warm_start_shots,
+    )
 
+    optimizer = SPSAOptimizer(
+        a=lr,
+        c=spsa_c,
+        A=spsa_A,
+        seed=seed,
+    )
 
+    best_energy = float("inf")
+    best_params = param_values.copy()
 
+    for it in range(max_iters):
+        old_params = param_values.copy()
+
+        # SPSA plus/minus circuits are executed in one backend call.
+        param_values, update, e_plus, e_minus, theta_plus, theta_minus = optimizer.step(
+            theta=param_values,
+            k=it,
+            evaluator=evaluator,
+            num_shots=num_shots,
+        )
+
+        # No third energy call. Use already-evaluated SPSA points.
+        if e_plus <= e_minus:
+            current_energy = e_plus
+            current_best_candidate = theta_plus
+        else:
+            current_energy = e_minus
+            current_best_candidate = theta_minus
+
+        if current_energy < best_energy:
+            best_energy = current_energy
+            best_params = current_best_candidate.copy()
+
+        max_update = float(np.max(np.abs(param_values - old_params)))
+
+        if verbose:
+            print(
+                f"Iter {it + 1:4d} | energy={current_energy:.6f} | "
+                f"best={best_energy:.6f} | max_update={max_update:.3e}"
+            )
+
+        if it > 2 and max_update < rel_tol:
+            if verbose:
+                print(f"Converged at iteration {it + 1}.")
+            break
+
+    # Final sampling uses same cached circuit. No remap/rebuild.
+    final_energy, hist = evaluator.energy_and_histogram(best_params, num_shots=final_shots)
+    z_best, cost_best = best_solution_from_histogram(hist, Q, q_linear, top_k=top_k)
+    final_circuit = evaluator.circuit_without_measurements(best_params)
+
+    if verbose:
+        print(f"Final estimated energy: {final_energy:.6f}")
+        print(f"Best sampled QUBO cost: {cost_best:.6f}")
+        print(f"Best sampled bitstring: {z_best}")
 
     return z_best, final_circuit, hist
+
+
+# Backward-compatible alias. Recommended solver name is dvqe(...).
+DVQE = dvqe

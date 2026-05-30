@@ -1,2 +1,2 @@
-from .core import DVQE
-__all__ = ['DVQE']
+from .core import dvqe
+__all__ = ['dvqe']

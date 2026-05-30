@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: raiselab
+Version: 0.0.1
+Summary: Modular VQE Framework (Monolithic + Distributed)
+Author: Milad Hasanzadeh
+Author-email: e.mhasanzadeh1377@yahoo.com
+License: MIT
+Requires-Python: >=3.8
+License-File: LICENSE.txt
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: qiskit==0.39.0
+Requires-Dist: qiskit-aer==0.11.0
+Requires-Dist: qiskit-terra==0.22.0
+Requires-Dist: qiskit-optimization==0.4.0
+Requires-Dist: diskit
+Requires-Dist: matplotlib
+Requires-Dist: joblib
+Dynamic: author
+Dynamic: author-email
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
