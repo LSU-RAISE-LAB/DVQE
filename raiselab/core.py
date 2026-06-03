@@ -291,6 +291,53 @@ def estimate_energy_from_histogram(
 
     return float(energy)
 
+def estimate_cvar_energy_from_histogram(
+    histogram: Dict[str, int],
+    Q: np.ndarray,
+    q_linear: np.ndarray,
+    alpha: float = 0.2,
+) -> float:
+    """
+    Estimate CVaR QUBO energy from sampled bitstrings.
+
+    alpha = 1.0 gives the normal mean energy.
+    alpha = 0.2 means use only the best 20% lowest-cost samples.
+
+    This is better for QUBO training because it focuses the optimizer
+    on high-quality bitstrings instead of the full average distribution.
+    """
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError("alpha must be in (0, 1].")
+
+    total = sum(histogram.values())
+
+    if total <= 0:
+        raise RuntimeError("Empty histogram. Cannot estimate CVaR energy.")
+
+    samples = []
+
+    for bstring, count in histogram.items():
+        z = np.array([int(b) for b in bstring], dtype=int)
+        cost = qubo_cost(z, Q, q_linear)
+        samples.append((cost, count))
+
+    samples.sort(key=lambda item: item[0])
+
+    target_count = max(1, int(np.ceil(alpha * total)))
+
+    used = 0
+    energy_sum = 0.0
+
+    for cost, count in samples:
+        take = min(count, target_count - used)
+        energy_sum += take * cost
+        used += take
+
+        if used >= target_count:
+            break
+
+    return float(energy_sum / used)
+
 
 # ====================================================
 # TOPOLOGY HELPER
@@ -362,6 +409,8 @@ class CachedCircuitEvaluator:
         backend=None,
         transpile_once: bool = True,
         transpile_optimization_level: int = 0,
+        energy_mode: str = "cvar",
+        cvar_alpha: float = 0.2,
     ):
         self.mode = mode
         self.Q = np.asarray(Q, dtype=float)
@@ -371,6 +420,8 @@ class CachedCircuitEvaluator:
         self.backend = backend if backend is not None else sim
         self.transpile_once = transpile_once
         self.transpile_optimization_level = transpile_optimization_level
+        self.energy_mode = energy_mode
+        self.cvar_alpha = cvar_alpha
 
         if self.Q.shape != (self.n, self.n):
             raise ValueError(f"Q must have shape {(self.n, self.n)}, got {self.Q.shape}.")
@@ -449,7 +500,23 @@ class CachedCircuitEvaluator:
         num_shots: int = 1024,
     ) -> float:
         histogram = self.counts(param_values, num_shots=num_shots)
-        return estimate_energy_from_histogram(histogram, self.Q, self.q_linear)
+
+        if self.energy_mode == "mean":
+            return estimate_energy_from_histogram(
+                histogram,
+                self.Q,
+            self.q_linear,
+            )
+
+        if self.energy_mode == "cvar":
+            return estimate_cvar_energy_from_histogram(
+                histogram,
+                self.Q,
+                self.q_linear,
+                alpha=self.cvar_alpha,
+            )
+
+        raise ValueError("energy_mode must be 'mean' or 'cvar'.")
 
     def energy_and_histogram(
         self,
@@ -749,10 +816,19 @@ def best_solution_from_histogram(
     histogram: Dict[str, int],
     Q: np.ndarray,
     q_linear: np.ndarray,
-    top_k: int = 100,
+    top_k: Optional[int] = None,
 ) -> Tuple[np.ndarray, float]:
-    """Return best QUBO solution among the top-k most frequent samples."""
-    sorted_counts = sorted(histogram.items(), key=lambda item: -item[1])[:top_k]
+    """
+    Return best QUBO solution from measured samples.
+
+    If top_k is None, search all unique sampled bitstrings.
+    This is better for larger QUBO problems because the best bitstring may
+    not be among the most frequent samples.
+    """
+    sorted_counts = sorted(histogram.items(), key=lambda item: -item[1])
+
+    if top_k is not None:
+        sorted_counts = sorted_counts[:top_k]
 
     best_cost = float("inf")
     z_best = None
@@ -800,7 +876,7 @@ def sample_final_solution(
         histogram,
         Q,
         q_linear,
-        top_k=top_k,
+        top_k=None,
     )
 
     if return_histogram:
@@ -881,7 +957,10 @@ def dvqe(
     verbose: bool = True,
     transpile_once: bool = True,
     transpile_optimization_level: int = 0,
-):
+    backend=None,
+    energy_mode: str = "cvar",
+    cvar_alpha: float = 0.2,
+    ):
     """
     Cached scalable DVQE solver with lowercase name: dvqe(...)
 
@@ -923,9 +1002,11 @@ def dvqe(
         q_linear=q_linear,
         depth=depth,
         qpu_qubit_config=qpu_qubit_config,
-        backend=sim,
+        backend=sim if backend is None else backend,
         transpile_once=transpile_once,
         transpile_optimization_level=transpile_optimization_level,
+        energy_mode=energy_mode,
+        cvar_alpha=cvar_alpha,
     )
 
     param_values = initialize_parameters(
@@ -970,6 +1051,13 @@ def dvqe(
             best_energy = current_energy
             best_params = current_best_candidate.copy()
 
+        if (it + 1) % 10 == 0:
+            updated_energy = energy_function(param_values)
+
+            if updated_energy < best_energy:
+                best_energy = updated_energy
+                best_params = param_values.copy()
+
         max_update = float(np.max(np.abs(param_values - old_params)))
 
         if verbose:
@@ -992,7 +1080,7 @@ def dvqe(
         hist,
         Q,
         q_linear,
-        top_k=top_k,
+        top_k=None,
     )
 
     final_circuit = evaluator.circuit_without_measurements(best_params)
