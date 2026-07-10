@@ -2127,6 +2127,156 @@ def _add_small_regularization(A, b, c, y_ref=None, eps_reg=1e-8):
     return A_reg, b_reg, c_reg
 
 
+def _recover_original_qp_duals(
+    A,
+    b,
+    G,
+    H,
+    x_sol,
+    lb,
+    ub,
+    lambda_eq_scaled,
+    lambda_ineq_scaled,
+    objective_scale,
+    G_row_norm,
+    H_row_norm,
+    bound_active_tol=1e-7
+):
+    """
+    Recover approximate dual variables for the original, unscaled QP.
+
+    Original problem:
+        min  x^T A x + b^T x + c
+        s.t. Gx = r
+             Hx <= h
+             lb <= x <= ub
+
+    The multipliers produced by dqp() correspond to the objective-scaled,
+    row-normalized problem solved internally by qqp(). For each linear
+    constraint row, the original multiplier is recovered as
+
+        lambda_original
+            = objective_scale * lambda_scaled / row_norm.
+
+    Bound multipliers are estimated from original-space stationarity using
+    the conventions
+
+        lb - x <= 0,  lambda_lb >= 0,
+        x - ub <= 0,  lambda_ub >= 0.
+    """
+    A = np.asarray(A, dtype=float)
+    b = np.asarray(b, dtype=float)
+    G = np.asarray(G, dtype=float)
+    H = np.asarray(H, dtype=float)
+    x_sol = np.asarray(x_sol, dtype=float)
+    lb = np.asarray(lb, dtype=float)
+    ub = np.asarray(ub, dtype=float)
+
+    lambda_eq_scaled = np.asarray(lambda_eq_scaled, dtype=float)
+    lambda_ineq_scaled = np.asarray(lambda_ineq_scaled, dtype=float)
+    G_row_norm = np.asarray(G_row_norm, dtype=float)
+    H_row_norm = np.asarray(H_row_norm, dtype=float)
+
+    if lambda_eq_scaled.size > 0:
+        lambda_eq = (
+            float(objective_scale)
+            * lambda_eq_scaled
+            / np.maximum(G_row_norm, 1e-12)
+        )
+    else:
+        lambda_eq = np.zeros(0, dtype=float)
+
+    if lambda_ineq_scaled.size > 0:
+        lambda_ineq = (
+            float(objective_scale)
+            * lambda_ineq_scaled
+            / np.maximum(H_row_norm, 1e-12)
+        )
+        lambda_ineq = np.maximum(lambda_ineq, 0.0)
+    else:
+        lambda_ineq = np.zeros(0, dtype=float)
+
+    # Original-space stationarity before bound multipliers.
+    stationarity_without_bounds = 2.0 * A @ x_sol + b
+
+    if G.shape[0] > 0:
+        stationarity_without_bounds += G.T @ lambda_eq
+
+    if H.shape[0] > 0:
+        stationarity_without_bounds += H.T @ lambda_ineq
+
+    lower_active = x_sol <= lb + bound_active_tol
+    upper_active = x_sol >= ub - bound_active_tol
+
+    lambda_lb = np.zeros_like(x_sol)
+    lambda_ub = np.zeros_like(x_sol)
+
+    # At a lower bound:
+    # grad L_without_bounds - lambda_lb = 0.
+    lambda_lb[lower_active] = np.maximum(
+        stationarity_without_bounds[lower_active],
+        0.0
+    )
+
+    # At an upper bound:
+    # grad L_without_bounds + lambda_ub = 0.
+    lambda_ub[upper_active] = np.maximum(
+        -stationarity_without_bounds[upper_active],
+        0.0
+    )
+
+    stationarity_full = (
+        stationarity_without_bounds
+        - lambda_lb
+        + lambda_ub
+    )
+
+    lower_bound_slack = x_sol - lb
+    upper_bound_slack = ub - x_sol
+
+    lower_bound_complementarity = lambda_lb * lower_bound_slack
+    upper_bound_complementarity = lambda_ub * upper_bound_slack
+
+    return {
+        "lambda_eq": lambda_eq.copy(),
+        "lambda_ineq": lambda_ineq.copy(),
+        "lambda_lb": lambda_lb.copy(),
+        "lambda_ub": lambda_ub.copy(),
+        "lambda_linear": np.concatenate([lambda_eq, lambda_ineq]),
+        "lambda_all": np.concatenate([
+            lambda_eq,
+            lambda_ineq,
+            lambda_lb,
+            lambda_ub,
+        ]),
+        "lambda_eq_scaled": lambda_eq_scaled.copy(),
+        "lambda_ineq_scaled": lambda_ineq_scaled.copy(),
+        "lower_bound_active": lower_active.copy(),
+        "upper_bound_active": upper_active.copy(),
+        "stationarity_without_bounds": stationarity_without_bounds.copy(),
+        "stationarity_full": stationarity_full.copy(),
+        "stationarity_without_bounds_inf": float(
+            np.linalg.norm(stationarity_without_bounds, ord=np.inf)
+        ),
+        "stationarity_full_inf": float(
+            np.linalg.norm(stationarity_full, ord=np.inf)
+        ),
+        "lower_bound_complementarity": (
+            lower_bound_complementarity.copy()
+        ),
+        "upper_bound_complementarity": (
+            upper_bound_complementarity.copy()
+        ),
+        "lower_bound_complementarity_inf": float(
+            np.linalg.norm(lower_bound_complementarity, ord=np.inf)
+        ),
+        "upper_bound_complementarity_inf": float(
+            np.linalg.norm(upper_bound_complementarity, ord=np.inf)
+        ),
+        "bound_active_tol": float(bound_active_tol),
+    }
+
+
 def qqp(
     A,
     b=None,
@@ -2148,41 +2298,96 @@ def qqp(
     regularize_weak_cost=True,
     eps_reg=1e-8,
 
+    # Original-QP dual recovery control
+    bound_active_tol=1e-7,
+
     return_info=True,
 
     **dqp_kwargs
 ):
     """
-    QQP: scaled wrapper around dqp().
+    QQP: scaled wrapper around dqp() with original-QP dual recovery.
 
-    It solves the QP in normalized variables:
+    Solves approximately:
 
-        x = x_center + x_scale * y
+        min_x  x^T A x + b^T x + c
+        s.t.   Gx = r
+               Hx <= h
+               lb <= x <= ub
 
-    where:
+    The internal normalized variables are
 
-        -1 <= y <= 1
+        x = x_center + x_scale * y,
+        -1 <= y <= 1.
 
-    This improves robustness for badly scaled QPs.
+    dqp() returns augmented-Lagrangian multiplier estimates for the scaled,
+    row-normalized problem. qqp() maps the equality and inequality
+    multipliers back to the original QP scaling and estimates active-bound
+    multipliers from original-space stationarity.
+
+    Returns
+    -------
+    If return_info=True:
+        x_sol, f_original, al_iters, info
+
+    Else:
+        x_sol, f_original, al_iters
+
+    The original-QP dual estimates and augmented-Lagrangian penalty
+    variables are returned automatically inside info. No additional QQP
+    output or call argument is required.
+
+    Notes
+    -----
+    The returned duals are augmented-Lagrangian estimates. Their quality
+    should be assessed using primal feasibility, stationarity, and
+    complementarity diagnostics. When regularize_weak_cost=True, the solved
+    internal objective contains a small regularization term, so the recovered
+    duals are approximate multipliers for the unregularized original QP.
     """
-
+    # ------------------------------------------------------------
+    # Input processing
+    # ------------------------------------------------------------
     A = np.asarray(A, dtype=float)
 
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         raise ValueError("A must be a square matrix.")
 
     n = A.shape[0]
+    A = _symmetrize(A)
 
     if b is None:
         b = np.zeros(n, dtype=float)
     else:
         b = np.asarray(b, dtype=float)
 
+    if b.shape != (n,):
+        raise ValueError("b must have shape (n,).")
+
     if lb is None or ub is None:
         raise ValueError("lb and ub must be provided.")
 
     lb = np.asarray(lb, dtype=float)
     ub = np.asarray(ub, dtype=float)
+
+    if lb.shape != (n,) or ub.shape != (n,):
+        raise ValueError("lb and ub must have shape (n,).")
+
+    if np.any(ub <= lb):
+        raise ValueError(
+            "Every upper bound must be greater than lower bound."
+        )
+
+    if bound_active_tol < 0:
+        raise ValueError("bound_active_tol must be nonnegative.")
+
+    # ------------------------------------------------------------
+    # Equality constraints
+    # ------------------------------------------------------------
+    if (G is None) != (r is None):
+        raise ValueError(
+            "G and r must either both be provided or both be None."
+        )
 
     if G is None:
         G = np.zeros((0, n), dtype=float)
@@ -2191,6 +2396,20 @@ def qqp(
         G = np.asarray(G, dtype=float)
         r = np.asarray(r, dtype=float)
 
+        if G.ndim != 2 or G.shape[1] != n:
+            raise ValueError("G must have shape (m,n).")
+
+        if r.shape != (G.shape[0],):
+            raise ValueError("r must have shape (m,).")
+
+    # ------------------------------------------------------------
+    # Inequality constraints
+    # ------------------------------------------------------------
+    if (H is None) != (h is None):
+        raise ValueError(
+            "H and h must either both be provided or both be None."
+        )
+
     if H is None:
         H = np.zeros((0, n), dtype=float)
         h = np.zeros(0, dtype=float)
@@ -2198,16 +2417,23 @@ def qqp(
         H = np.asarray(H, dtype=float)
         h = np.asarray(h, dtype=float)
 
+        if H.ndim != 2 or H.shape[1] != n:
+            raise ValueError("H must have shape (p,n).")
+
+        if h.shape != (H.shape[0],):
+            raise ValueError("h must have shape (p,).")
+
+    if G.shape[0] == 0 and H.shape[0] == 0:
+        raise ValueError(
+            "At least one equality or inequality constraint must be provided."
+        )
+
     # ------------------------------------------------------------
     # 1) Variable scaling: x = x_center + x_scale * y
     # ------------------------------------------------------------
-
     x_center = 0.5 * (lb + ub)
     x_scale = 0.5 * (ub - lb)
-
     x_scale = np.maximum(x_scale, 1e-12)
-
-    S = np.diag(x_scale)
 
     y_lb = -np.ones(n, dtype=float)
     y_ub = np.ones(n, dtype=float)
@@ -2216,32 +2442,42 @@ def qqp(
         y0 = np.zeros(n, dtype=float)
     else:
         x0 = np.asarray(x0, dtype=float)
+
+        if x0.shape != (n,):
+            raise ValueError("x0 must have shape (n,).")
+
         x0 = np.clip(x0, lb, ub)
         y0 = (x0 - x_center) / x_scale
         y0 = np.clip(y0, y_lb, y_ub)
 
     # ------------------------------------------------------------
-    # 2) Transform objective to y-space
+    # 2) Transform objective into y-space
     # ------------------------------------------------------------
+    A_y_unscaled = A * np.outer(x_scale, x_scale)
+    b_y_unscaled = x_scale * (2.0 * (A @ x_center) + b)
+    c_y_unscaled = _objective(A, b, c, x_center)
 
-    A_y = S.T @ A @ S
-    b_y = 2.0 * S.T @ A @ x_center + S.T @ b
-    c_y = float(x_center.T @ A @ x_center + b.T @ x_center + c)
+    A_y = A_y_unscaled.copy()
+    b_y = b_y_unscaled.copy()
+    c_y = float(c_y_unscaled)
 
     # ------------------------------------------------------------
-    # 3) Transform constraints to y-space
+    # 3) Transform constraints into y-space
     # ------------------------------------------------------------
+    G_y_unscaled = G * x_scale[None, :]
+    r_y_unscaled = r - G @ x_center
 
-    G_y = G @ S
-    r_y = r - G @ x_center
+    H_y_unscaled = H * x_scale[None, :]
+    h_y_unscaled = h - H @ x_center
 
-    H_y = H @ S
-    h_y = h - H @ x_center
+    G_y = G_y_unscaled.copy()
+    r_y = r_y_unscaled.copy()
+    H_y = H_y_unscaled.copy()
+    h_y = h_y_unscaled.copy()
 
     # ------------------------------------------------------------
     # 4) Normalize constraint rows
     # ------------------------------------------------------------
-
     if normalize_constraints:
         G_y, r_y, G_row_norm = _normalize_constraint_rows(G_y, r_y)
         H_y, h_y, H_row_norm = _normalize_constraint_rows(H_y, h_y)
@@ -2252,7 +2488,6 @@ def qqp(
     # ------------------------------------------------------------
     # 5) Scale objective coefficients
     # ------------------------------------------------------------
-
     objective_scale = 1.0
 
     if scale_objective:
@@ -2266,10 +2501,13 @@ def qqp(
         b_y = b_y / objective_scale
         c_y = c_y / objective_scale
 
+    A_y_before_regularization = A_y.copy()
+    b_y_before_regularization = b_y.copy()
+    c_y_before_regularization = float(c_y)
+
     # ------------------------------------------------------------
     # 6) Regularize weak-cost / constraint-only variables
     # ------------------------------------------------------------
-
     if regularize_weak_cost:
         A_y, b_y, c_y = _add_small_regularization(
             A=A_y,
@@ -2280,60 +2518,185 @@ def qqp(
         )
 
     # ------------------------------------------------------------
-    # 7) Solve scaled QP using existing dqp()
+    # 7) Solve scaled QP using dqp()
     # ------------------------------------------------------------
-
     y_sol, f_y, al_iters, info = dqp(
         A=A_y,
         b=b_y,
         c=c_y,
-
         G=G_y,
         r=r_y,
-
         H=H_y,
         h=h_y,
-
         x0=y0,
         lb=y_lb,
         ub=y_ub,
-
         return_info=True,
-
         **dqp_kwargs
     )
 
     # ------------------------------------------------------------
-    # 8) Map solution back to original x-space
+    # 8) Map the primal solution back to original x-space
     # ------------------------------------------------------------
-
     x_sol = x_center + x_scale * y_sol
     x_sol = np.clip(x_sol, lb, ub)
-
-    f_original = float(x_sol.T @ A @ x_sol + b.T @ x_sol + c)
+    f_original = _objective(A, b, c, x_sol)
 
     if info is None:
         info = {}
 
+    # ------------------------------------------------------------
+    # 9) Recover original-QP linear and bound multipliers
+    # ------------------------------------------------------------
+    lambda_eq_scaled = np.asarray(
+        info.get(
+            "final_lambda_eq",
+            np.zeros(G.shape[0], dtype=float)
+        ),
+        dtype=float
+    )
+
+    lambda_ineq_scaled = np.asarray(
+        info.get(
+            "final_lambda_ineq",
+            np.zeros(H.shape[0], dtype=float)
+        ),
+        dtype=float
+    )
+
+    duals = _recover_original_qp_duals(
+        A=A,
+        b=b,
+        G=G,
+        H=H,
+        x_sol=x_sol,
+        lb=lb,
+        ub=ub,
+        lambda_eq_scaled=lambda_eq_scaled,
+        lambda_ineq_scaled=lambda_ineq_scaled,
+        objective_scale=objective_scale,
+        G_row_norm=G_row_norm,
+        H_row_norm=H_row_norm,
+        bound_active_tol=bound_active_tol
+    )
+
+    # ------------------------------------------------------------
+    # 10) Original-QP residual and complementarity diagnostics
+    # ------------------------------------------------------------
+    if G.shape[0] > 0:
+        original_eq_residual = G @ x_sol - r
+    else:
+        original_eq_residual = np.zeros(0, dtype=float)
+
+    if H.shape[0] > 0:
+        original_ineq_residual = H @ x_sol - h
+        original_ineq_violation = np.maximum(
+            original_ineq_residual,
+            0.0
+        )
+        original_ineq_complementarity = (
+            duals["lambda_ineq"] * original_ineq_residual
+        )
+    else:
+        original_ineq_residual = np.zeros(0, dtype=float)
+        original_ineq_violation = np.zeros(0, dtype=float)
+        original_ineq_complementarity = np.zeros(0, dtype=float)
+
+    original_eq_residual_inf = (
+        float(np.linalg.norm(original_eq_residual, ord=np.inf))
+        if original_eq_residual.size > 0 else 0.0
+    )
+
+    original_ineq_violation_inf = (
+        float(np.linalg.norm(original_ineq_violation, ord=np.inf))
+        if original_ineq_violation.size > 0 else 0.0
+    )
+
+    original_ineq_complementarity_inf = (
+        float(
+            np.linalg.norm(
+                original_ineq_complementarity,
+                ord=np.inf
+            )
+        )
+        if original_ineq_complementarity.size > 0 else 0.0
+    )
+
+    duals.update({
+        "original_eq_residual": original_eq_residual.copy(),
+        "original_ineq_residual": original_ineq_residual.copy(),
+        "original_ineq_violation": original_ineq_violation.copy(),
+        "original_ineq_complementarity": (
+            original_ineq_complementarity.copy()
+        ),
+        "original_eq_residual_inf": original_eq_residual_inf,
+        "original_ineq_violation_inf": original_ineq_violation_inf,
+        "original_ineq_complementarity_inf": (
+            original_ineq_complementarity_inf
+        ),
+    })
+
+    # ------------------------------------------------------------
+    # 11) Preserve and extend the full info dictionary
+    # ------------------------------------------------------------
     info["qqp_used"] = True
     info["scaled_solution_y"] = y_sol.copy()
     info["original_solution_x"] = x_sol.copy()
-
     info["scaled_objective"] = float(f_y)
-    info["original_objective"] = f_original
+    info["original_objective"] = float(f_original)
+
+    # Explicit original-QP dual outputs retained inside info as well.
+    info["duals_original_qp"] = duals
+    info["final_lambda_eq_original"] = duals["lambda_eq"].copy()
+    info["final_lambda_ineq_original"] = duals["lambda_ineq"].copy()
+    info["final_lambda_lb_original"] = duals["lambda_lb"].copy()
+    info["final_lambda_ub_original"] = duals["lambda_ub"].copy()
+    info["final_lambda_linear_original"] = (
+        duals["lambda_linear"].copy()
+    )
+    info["final_lambda_all_original"] = duals["lambda_all"].copy()
+
+    info["original_stationarity_without_bounds"] = (
+        duals["stationarity_without_bounds"].copy()
+    )
+    info["original_stationarity_without_bounds_inf"] = (
+        duals["stationarity_without_bounds_inf"]
+    )
+    info["original_stationarity_full"] = (
+        duals["stationarity_full"].copy()
+    )
+    info["original_stationarity_full_inf"] = (
+        duals["stationarity_full_inf"]
+    )
+
+    info["original_eq_residual"] = original_eq_residual.copy()
+    info["original_ineq_residual"] = original_ineq_residual.copy()
+    info["original_ineq_violation"] = original_ineq_violation.copy()
+    info["original_eq_residual_inf"] = original_eq_residual_inf
+    info["original_ineq_violation_inf"] = (
+        original_ineq_violation_inf
+    )
+    info["original_ineq_complementarity_inf"] = (
+        original_ineq_complementarity_inf
+    )
 
     info["scaling_info"] = {
         "x_center": x_center.copy(),
         "x_scale": x_scale.copy(),
-        "objective_scale": objective_scale,
+        "objective_scale": float(objective_scale),
         "G_row_norm": G_row_norm.copy(),
         "H_row_norm": H_row_norm.copy(),
         "normalize_constraints": normalize_constraints,
         "scale_objective": scale_objective,
         "regularize_weak_cost": regularize_weak_cost,
-        "eps_reg": eps_reg,
+        "eps_reg": float(eps_reg),
+        "dual_recovery_rule": (
+            "lambda_original = objective_scale * "
+            "lambda_scaled / constraint_row_norm"
+        ),
     }
 
+    # Final internal scaled problem actually passed to dqp().
     info["scaled_problem"] = {
         "A_y": A_y.copy(),
         "b_y": b_y.copy(),
@@ -2346,11 +2709,87 @@ def qqp(
         "y_ub": y_ub.copy(),
     }
 
+    # Additional records do not remove any prior QQP/DQP histories.
+    info["transformed_problem_before_scaling"] = {
+        "A_y_unscaled": A_y_unscaled.copy(),
+        "b_y_unscaled": b_y_unscaled.copy(),
+        "c_y_unscaled": float(c_y_unscaled),
+        "G_y_unscaled": G_y_unscaled.copy(),
+        "r_y_unscaled": r_y_unscaled.copy(),
+        "H_y_unscaled": H_y_unscaled.copy(),
+        "h_y_unscaled": h_y_unscaled.copy(),
+    }
+
+    info["scaled_objective_before_regularization"] = {
+        "A_y": A_y_before_regularization.copy(),
+        "b_y": b_y_before_regularization.copy(),
+        "c_y": float(c_y_before_regularization),
+    }
+
+    info["dual_recovery_warning"] = (
+        "The returned equality and inequality multipliers are "
+        "augmented-Lagrangian estimates. When regularize_weak_cost=True, "
+        "the internally solved objective includes a small regularization "
+        "term, so these are approximate duals for the unregularized QP."
+    )
+
+    # ------------------------------------------------------------
+    # 12) Store duals and AL penalty variables automatically
+    # ------------------------------------------------------------
+    # Original-QP dual estimates are always placed in info so that the
+    # historical QQP call and four-output unpacking remain unchanged.
+    info["duals"] = duals
+    info["dual_variables"] = duals
+
+    # Convenience aliases for direct access.
+    info["lambda_eq"] = duals["lambda_eq"].copy()
+    info["lambda_ineq"] = duals["lambda_ineq"].copy()
+    info["lambda_lb"] = duals["lambda_lb"].copy()
+    info["lambda_ub"] = duals["lambda_ub"].copy()
+    info["lambda_linear"] = duals["lambda_linear"].copy()
+    info["lambda_all"] = duals["lambda_all"].copy()
+
+    # The penalty variables used by the PHR augmented-Lagrangian method.
+    # These include the final penalty parameter, its history and update
+    # records, as well as the scaled internal multiplier estimates.
+    penalty_variables = {
+        "mu": float(info.get("final_mu", np.nan)),
+        "mu_final": float(info.get("final_mu", np.nan)),
+        "mu_history": list(info.get("mu_history", [])),
+        "mu_update_history": list(info.get("mu_update_history", [])),
+        "lambda_eq_scaled": np.asarray(
+            info.get("final_lambda_eq", np.zeros(G.shape[0])),
+            dtype=float
+        ).copy(),
+        "lambda_ineq_scaled": np.asarray(
+            info.get("final_lambda_ineq", np.zeros(H.shape[0])),
+            dtype=float
+        ).copy(),
+        "lambda_scaled": np.asarray(
+            info.get("final_lambda", np.zeros(G.shape[0] + H.shape[0])),
+            dtype=float
+        ).copy(),
+        "phr_region_mask": np.asarray(
+            info.get("final_phr_region_mask", np.zeros(H.shape[0], dtype=bool)),
+            dtype=bool
+        ).copy(),
+        "phr_region_indices": np.asarray(
+            info.get("final_phr_region_indices", np.zeros(0, dtype=int)),
+            dtype=int
+        ).copy(),
+    }
+
+    info["penalty_variables"] = penalty_variables
+    info["penalty_vars"] = penalty_variables
+    info["mu"] = penalty_variables["mu"]
+
+    # ------------------------------------------------------------
+    # 13) Return using the original QQP interface
+    # ------------------------------------------------------------
     if return_info:
         return x_sol, f_original, al_iters, info
 
     return x_sol, f_original, al_iters
-
 
 
 def qqp_runtime_summary(info, print_summary=True):
